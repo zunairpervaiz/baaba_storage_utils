@@ -14,6 +14,9 @@
 // For those, use HiveStorage instead.
 // ─────────────────────────────────────────────────────────────────────────────
 
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../exceptions/storage_exception.dart';
@@ -33,6 +36,15 @@ class PrefsStorage {
   /// The underlying SharedPreferences object from the Flutter plugin.
   /// It is null until [init] is called.
   static SharedPreferences? _prefs;
+
+  /// Broadcast stream controller that fires whenever a value is written or deleted.
+  /// Using broadcast so multiple listeners (widgets) can subscribe simultaneously.
+  static final StreamController<MapEntry<String, dynamic>> _changeController =
+      StreamController<MapEntry<String, dynamic>>.broadcast();
+
+  /// Per-key ValueNotifiers for use with [ValueListenableBuilder].
+  /// Stored as dynamic so any value type can be held.
+  static final Map<String, ValueNotifier<dynamic>> _notifiers = {};
 
   /// Returns the singleton instance, creating it if it doesn't exist yet.
   ///
@@ -61,6 +73,60 @@ class PrefsStorage {
     return _prefs!;
   }
 
+  // ── Reactive helpers ──────────────────────────────────────────────────────
+  // These allow UI widgets to respond to pref changes automatically,
+  // without manually calling setState.
+
+  /// A broadcast [Stream] of every write or delete as [MapEntry<key, value>].
+  /// The value is `null` when a key is removed or the store is cleared.
+  ///
+  /// Most consumers should prefer [watch] to scope events to a single key.
+  Stream<MapEntry<String, dynamic>> get changes => _changeController.stream;
+
+  /// Returns a typed [Stream<T?>] that emits whenever [key]'s value changes.
+  /// Emits `null` when [key] is removed or the store is cleared.
+  ///
+  /// Use with [StreamBuilder] to auto-rebuild a widget:
+  /// ```dart
+  /// StreamBuilder<bool?>(
+  ///   stream: BaabaStorage.prefs.watch<bool>('darkMode'),
+  ///   builder: (context, snapshot) {
+  ///     final isDark = snapshot.data ?? false;
+  ///     return Switch(value: isDark, onChanged: (v) => ...);
+  ///   },
+  /// );
+  /// ```
+  Stream<T?> watch<T>(String key) => _changeController.stream
+      .where((e) => e.key == key)
+      .map((e) => e.value == null ? null : e.value as T?);
+
+  /// Returns a [ValueListenable<dynamic>] for [key], suitable for
+  /// [ValueListenableBuilder]. The notifier's value updates whenever [key]
+  /// changes. Cast `.value` to the expected type inside the builder.
+  ///
+  /// Example:
+  /// ```dart
+  /// ValueListenableBuilder<dynamic>(
+  ///   valueListenable: BaabaStorage.prefs.listenable('darkMode'),
+  ///   builder: (context, value, _) {
+  ///     return Switch(value: value as bool? ?? false, onChanged: ...);
+  ///   },
+  /// );
+  /// ```
+  ValueListenable<dynamic> listenable(String key) {
+    return _notifiers.putIfAbsent(
+      key,
+      () => ValueNotifier<dynamic>(get<dynamic>(key)),
+    );
+  }
+
+  /// Dispatches [value] (or `null` on delete) to the stream and updates
+  /// any active [ValueNotifier] for [key].
+  void _notify(String key, dynamic value) {
+    _changeController.add(MapEntry(key, value));
+    _notifiers[key]?.value = value;
+  }
+
   // ── Generic API ───────────────────────────────────────────────────────────
 
   /// Stores [value] under [key]. The type [T] is inferred automatically.
@@ -73,20 +139,30 @@ class PrefsStorage {
   /// Example:
   ///   await prefs.set`<String>`('username', 'Zunair');
   ///   await prefs.set`<bool>`('darkMode', true);
-  Future<bool> set<T>(String key, T value) {
+  Future<bool> set<T>(String key, T value) async {
     final sp = _sp;
+    bool result;
 
     // Check the runtime type of value and delegate to the correct
     // SharedPreferences method. Order matters — check bool before int
     // because bool is a subtype of Object but not int.
-    if (value is String) return sp.setString(key, value);
-    if (value is int) return sp.setInt(key, value);
-    if (value is double) return sp.setDouble(key, value);
-    if (value is bool) return sp.setBool(key, value);
-    if (value is List<String>) return sp.setStringList(key, value);
+    if (value is String) {
+      result = await sp.setString(key, value);
+    } else if (value is int) {
+      result = await sp.setInt(key, value);
+    } else if (value is double) {
+      result = await sp.setDouble(key, value);
+    } else if (value is bool) {
+      result = await sp.setBool(key, value);
+    } else if (value is List<String>) {
+      result = await sp.setStringList(key, value);
+    } else {
+      // If none of the above matched, the type is not supported.
+      throw UnsupportedTypeException(T);
+    }
 
-    // If none of the above matched, the type is not supported.
-    throw UnsupportedTypeException(T);
+    if (result) _notify(key, value);
+    return result;
   }
 
   /// Reads the value stored under [key] and casts it to [T].
@@ -127,48 +203,79 @@ class PrefsStorage {
       _sp.getString(key) ?? defaultValue;
 
   /// Writes a [String] value. Returns `true` on success.
-  Future<bool> setString(String key, String value) =>
-      _sp.setString(key, value);
+  Future<bool> setString(String key, String value) async {
+    final result = await _sp.setString(key, value);
+    if (result) _notify(key, value);
+    return result;
+  }
 
   /// Reads an [int] value. Returns [defaultValue] if the key is absent.
   int? getInt(String key, {int? defaultValue}) =>
       _sp.getInt(key) ?? defaultValue;
 
   /// Writes an [int] value. Returns `true` on success.
-  Future<bool> setInt(String key, int value) => _sp.setInt(key, value);
+  Future<bool> setInt(String key, int value) async {
+    final result = await _sp.setInt(key, value);
+    if (result) _notify(key, value);
+    return result;
+  }
 
   /// Reads a [double] value. Returns [defaultValue] if the key is absent.
   double? getDouble(String key, {double? defaultValue}) =>
       _sp.getDouble(key) ?? defaultValue;
 
   /// Writes a [double] value. Returns `true` on success.
-  Future<bool> setDouble(String key, double value) =>
-      _sp.setDouble(key, value);
+  Future<bool> setDouble(String key, double value) async {
+    final result = await _sp.setDouble(key, value);
+    if (result) _notify(key, value);
+    return result;
+  }
 
   /// Reads a [bool] value. Returns [defaultValue] if the key is absent.
   bool? getBool(String key, {bool? defaultValue}) =>
       _sp.getBool(key) ?? defaultValue;
 
   /// Writes a [bool] value. Returns `true` on success.
-  Future<bool> setBool(String key, bool value) => _sp.setBool(key, value);
+  Future<bool> setBool(String key, bool value) async {
+    final result = await _sp.setBool(key, value);
+    if (result) _notify(key, value);
+    return result;
+  }
 
   /// Reads a [List<String>] value. Returns [defaultValue] if the key is absent.
   List<String>? getStringList(String key, {List<String>? defaultValue}) =>
       _sp.getStringList(key) ?? defaultValue;
 
   /// Writes a [List<String>] value. Returns `true` on success.
-  Future<bool> setStringList(String key, List<String> value) =>
-      _sp.setStringList(key, value);
+  Future<bool> setStringList(String key, List<String> value) async {
+    final result = await _sp.setStringList(key, value);
+    if (result) _notify(key, value);
+    return result;
+  }
 
   // ── Deletion ──────────────────────────────────────────────────────────────
 
   /// Removes the value stored under [key].
   /// Does nothing if the key doesn't exist.
-  Future<bool> remove(String key) => _sp.remove(key);
+  Future<bool> remove(String key) async {
+    final result = await _sp.remove(key);
+    if (result) _notify(key, null);
+    return result;
+  }
 
   /// Removes ALL stored key/value pairs.
   /// Use with caution — this cannot be undone.
-  Future<bool> clear() => _sp.clear();
+  Future<bool> clear() async {
+    // Capture keys before clearing — they'll be gone afterwards.
+    final keys = _sp.getKeys().toList();
+    final result = await _sp.clear();
+    if (result) {
+      for (final key in keys) {
+        _notify(key, null);
+      }
+    }
+    return result;
+  }
 
   // ── Inspection ────────────────────────────────────────────────────────────
 

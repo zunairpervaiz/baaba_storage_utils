@@ -96,6 +96,53 @@ void main() {
         throwsA(isA<UnsupportedTypeException>()),
       );
     });
+
+    // ── Reactive ────────────────────────────────────────────────────────────
+
+    test('watch<String> emits new value on setString', () async {
+      final future = PrefsStorage.instance.watch<String>('reactKey').first;
+      await PrefsStorage.instance.setString('reactKey', 'hello');
+      expect(await future, 'hello');
+    });
+
+    test('watch<bool> emits new value on set<T>', () async {
+      final future = PrefsStorage.instance.watch<bool>('flag').first;
+      await PrefsStorage.instance.set<bool>('flag', true);
+      expect(await future, true);
+    });
+
+    test('watch emits null when key is removed', () async {
+      await PrefsStorage.instance.setString('toRemove', 'bye');
+      final future = PrefsStorage.instance.watch<String>('toRemove').first;
+      await PrefsStorage.instance.remove('toRemove');
+      expect(await future, null);
+    });
+
+    test('watch emits null for all keys on clear', () async {
+      await PrefsStorage.instance.setString('c1', 'v1');
+      await PrefsStorage.instance.setString('c2', 'v2');
+      final f1 = PrefsStorage.instance.watch<String>('c1').first;
+      final f2 = PrefsStorage.instance.watch<String>('c2').first;
+      await PrefsStorage.instance.clear();
+      expect(await f1, null);
+      expect(await f2, null);
+    });
+
+    test('listenable updates value on write', () async {
+      await PrefsStorage.instance.setInt('score', 0);
+      final notifier = PrefsStorage.instance.listenable('score');
+      expect(notifier.value, 0);
+      await PrefsStorage.instance.setInt('score', 42);
+      expect(notifier.value, 42);
+    });
+
+    test('changes stream fires MapEntry for every write', () async {
+      final future = PrefsStorage.instance.changes.first;
+      await PrefsStorage.instance.setString('evt', 'fired');
+      final entry = await future;
+      expect(entry.key, 'evt');
+      expect(entry.value, 'fired');
+    });
   });
 
   // ── HiveStorage ─────────────────────────────────────────────────────────
