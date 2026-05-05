@@ -2,11 +2,11 @@
 
 A unified Flutter storage package that wraps **SharedPreferences**, **Hive**, and **Flutter Secure Storage** behind one clean API.
 
-| Storage | Best for |
-|---|---|
-| `BaabaStorage.prefs` | Simple flags, settings, primitive values |
-| `BaabaStorage.hive` | Lists, maps, custom objects, reactive UI |
-| `BaabaStorage.secure` | Tokens, API keys, passwords |
+| Storage | Best for | Reactive? |
+|---|---|---|
+| `BaabaStorage.prefs` | Simple flags, settings, primitive values | ✅ `watch` / `listenable` |
+| `BaabaStorage.hive` | Lists, maps, custom objects | ✅ `watch` / `listenable` |
+| `BaabaStorage.secure` | Tokens, API keys, passwords | — |
 
 ---
 
@@ -69,6 +69,45 @@ await BaabaStorage.prefs.clear();              // remove everything
 BaabaStorage.prefs.containsKey('theme');       // bool
 BaabaStorage.prefs.getKeys();                  // Set<String>
 BaabaStorage.prefs.getAll();                   // Map<String, dynamic>
+```
+
+### Reactive UI with StreamBuilder
+
+Use `watch<T>` to rebuild a widget automatically whenever a pref value changes:
+
+```dart
+StreamBuilder<bool?>(
+  stream: BaabaStorage.prefs.watch<bool>('darkMode'),
+  builder: (context, snapshot) {
+    final isDark = snapshot.data ?? false;
+    return Switch(
+      value: isDark,
+      onChanged: (v) => BaabaStorage.prefs.setBool('darkMode', v),
+    );
+  },
+);
+```
+
+### Reactive UI with ValueListenableBuilder
+
+```dart
+ValueListenableBuilder<dynamic>(
+  valueListenable: BaabaStorage.prefs.listenable('darkMode'),
+  builder: (context, value, _) {
+    return Switch(
+      value: value as bool? ?? false,
+      onChanged: (v) => BaabaStorage.prefs.setBool('darkMode', v),
+    );
+  },
+);
+```
+
+### Listen to all pref changes
+
+```dart
+BaabaStorage.prefs.changes.listen((entry) {
+  print('${entry.key} → ${entry.value}');  // value is null when removed
+});
 ```
 
 ---

@@ -1,6 +1,6 @@
 name: baaba_storage_utils
 description: "A unified Flutter storage package combining SharedPreferences, Hive, and Flutter Secure Storage with a clean, simple API."
-version: 1.0.0
+version: 1.1.0
 homepage:
 
 environment:
