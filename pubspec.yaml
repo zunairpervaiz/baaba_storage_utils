@@ -1,6 +1,6 @@
 name: baaba_storage_utils
 description: "A unified Flutter storage package combining SharedPreferences, Hive, and Flutter Secure Storage with a clean, simple API."
-version: 1.1.1
+version: 1.2.0
 homepage:
 
 environment:
@@ -11,6 +11,10 @@ dependencies:
   flutter:
     sdk: flutter
   shared_preferences: ^2.5.5
+  # Direct dependency because baaba_storage_utils.dart re-exports Hive's types.
+  # hive_flutter re-exports hive too, but the version we hand to consumers
+  # should be one we pin ourselves rather than inherit.
+  hive: ^2.2.3
   hive_flutter: ^1.1.0
   flutter_secure_storage: ^10.0.0
 

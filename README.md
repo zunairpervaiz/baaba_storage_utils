@@ -155,12 +155,49 @@ class UserProfile extends HiveObject {
 BaabaStorage.hive.registerAdapter(UserProfileAdapter());
 
 // 3. Open a typed box
-await BaabaStorage.hive.openBox<UserProfile>('profiles');
+await BaabaStorage.hive.openTypedBox<UserProfile>('profiles');
 
 // 4. Store and retrieve
 final profile = UserProfile()..name = 'Zunair'..age = 25;
 await BaabaStorage.hive.put('profiles', 'current', profile);
 final loaded = BaabaStorage.hive.get<UserProfile>('profiles', 'current');
+```
+
+### Lazy boxes
+
+A lazy box keeps only its keys in memory and reads each value from disk on
+demand — the right choice when values are large blobs or the box holds a lot of
+entries.
+
+```dart
+await BaabaStorage.hive.openLazyBox('queue');
+
+// Writes and metadata are identical to a regular box
+await BaabaStorage.hive.put('queue', 'job-1', payload);
+BaabaStorage.hive.length('queue');
+BaabaStorage.hive.getKeys('queue');
+await BaabaStorage.hive.delete('queue', 'job-1');
+
+// Reads are async, because that is when the disk read happens
+final job = await BaabaStorage.hive.getLazy<String>('queue', 'job-1');
+final all = await BaabaStorage.hive.getAllLazy<String>('queue');
+```
+
+`get`, `getAll` and `listenable` hand back values synchronously, so they cannot
+work on a lazy box and throw `BoxIsLazyException`. Everything else — `put`,
+`putAll`, `delete`, `deleteKeys`, `clearBox`, `getKeys`, `containsKey`,
+`length`, `isEmpty`, `watch`, `closeBox`, `deleteBox` — works on both flavours.
+
+`getLazy` and `getAllLazy` also accept regular boxes, so code that does not know
+how a box was opened can always use them. `isBoxLazy('queue')` answers if it
+needs to branch.
+
+A box name can only be open in one flavour at a time. Asking for another one
+throws `BoxTypeMismatchException` rather than a raw `HiveError`:
+
+```dart
+await BaabaStorage.hive.openLazyBox('queue');
+await BaabaStorage.hive.openBox('queue');  // throws BoxTypeMismatchException
 ```
 
 ### Reactive UI with ValueListenableBuilder
@@ -273,6 +310,8 @@ await BaabaStorage.dispose();
 |---|---|
 | `StorageNotInitializedException` | Any storage accessed before `BaabaStorage.init()` |
 | `BoxNotOpenException` | `hive.get/put/delete` called on a box that was never opened |
+| `BoxIsLazyException` | `hive.get`, `getAll` or `listenable` called on a lazy box — use `getLazy` / `getAllLazy` |
+| `BoxTypeMismatchException` | A box name is already open in another flavour (lazy vs regular, or a different value type) |
 | `UnsupportedTypeException` | `prefs.set<T>` called with an unsupported type |
 
 ```dart

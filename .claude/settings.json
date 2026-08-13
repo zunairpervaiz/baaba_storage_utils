@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sed -n 165,195p ~/AppData/Local/Pub/Cache/hosted/pub.dev/hive-2*/lib/src/hive_impl.dart)",
+      "Bash(python -c ' *)",
+      "Bash(flutter test *)",
+      "PowerShell(flutter test test/scratch_repro_test.dart)",
+      "Bash(grep -E '^\\\\s+\\(name: \\(hive|hive_flutter|shared_preferences|flutter_secure_storage\\)$|version: \\)' pubspec.lock)",
+      "Bash(grep -A1 -E \"name: \\(hive|hive_flutter|shared_preferences|flutter_secure_storage\\)$\")"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\muhammad.zunair\\AppData\\Local\\Pub\\Cache\\hosted\\pub.dev\\hive-2*\\lib\\src"
+    ]
+  }
+}

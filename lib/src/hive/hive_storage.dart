@@ -73,19 +73,113 @@ class HiveStorage {
     if (!_initialized) throw const StorageNotInitializedException();
   }
 
-  /// Internal helper that retrieves an already-open box as `Box<dynamic>`.
+  // ── Box bookkeeping ───────────────────────────────────────────────────────
+  //
+  // Hive keys every box by name alone, but a name can be open as any one of
+  // Box<dynamic>, Box<T> or LazyBox<dynamic> — and Hive gives us no accessor
+  // that works across all three. Hive.box<E>(name) throws unless the box is
+  // eager *and* its value type is exactly E; Hive.lazyBox<E>(name) is the
+  // mirror image. Hive.isBoxOpen, meanwhile, answers for all three.
+  //
+  // So we remember what we opened — the box *and* the value type it was opened
+  // with, because Dart generics are covariant and `box is Box<dynamic>` is
+  // therefore true of a Box<UserProfile> as well. Recording the type is the
+  // only way to tell the two apart.
+  //
+  // That bookkeeping lets us route each operation to the widest type that
+  // supports it (BoxBase for anything both flavours share, Box only for the
+  // value-in-memory reads) and raise our own exception naming the caller's
+  // mistake, instead of a HiveError from Hive's internals.
+
+  /// Every box this wrapper knows to be open, keyed by [_key].
+  final Map<String, _OpenBox> _openedBoxes = <String, _OpenBox>{};
+
+  /// Canonical map key for a box name.
   ///
-  /// We always use `Box<dynamic>` internally (never `Box<String>`, `Box<int>`, etc.)
-  /// because Hive throws a runtime error if the same box is opened with
-  /// one type and then accessed with a different generic parameter.
-  /// By using dynamic everywhere internally and casting at the Dart level
-  /// when reading, we avoid that class of errors entirely.
-  Box<dynamic> _box(String name) {
+  /// Hive lower-cases box names when opening them, so `openBox('Cache')` and
+  /// `get('cache', …)` are the same box. We follow the same rule so our
+  /// bookkeeping can never drift from Hive's.
+  static String _key(String name) => name.toLowerCase();
+
+  /// Records [box] — opened with value type [valueType] — and returns it.
+  B _remember<B extends BoxBase<dynamic>>(String name, B box, Type valueType) {
+    _openedBoxes[_key(name)] = _OpenBox(box, valueType);
+    return box;
+  }
+
+  /// Returns the record for the open box named [name], or `null` if there is
+  /// none this wrapper can reach.
+  ///
+  /// Prefers our own record — the only thing that knows the box's flavour and
+  /// value type — and falls back to probing Hive so that boxes opened outside
+  /// this wrapper (e.g. a bare `Hive.openLazyBox` elsewhere in your app) still
+  /// work through the facade. A box opened elsewhere with a non-dynamic value
+  /// type cannot be adopted; that returns `null` too, and callers report it
+  /// separately from "not open".
+  _OpenBox? _lookup(String name) {
+    final key = _key(name);
+
+    final tracked = _openedBoxes[key];
+    if (tracked != null) {
+      if (tracked.box.isOpen) return tracked;
+      // Closed behind our back — box.close(), Hive.close(), deleteFromDisk().
+      _openedBoxes.remove(key);
+    }
+
+    if (!Hive.isBoxOpen(key)) return null;
+
+    // Open, but not by us. Probe both flavours; at most one can succeed, and
+    // only for a dynamic box — the probes ask for value type dynamic.
+    try {
+      _remember(key, Hive.box<dynamic>(key), dynamic);
+      return _openedBoxes[key];
+    } on HiveError {
+      // Not an eager dynamic box.
+    }
+    try {
+      _remember(key, Hive.lazyBox<dynamic>(key), dynamic);
+      return _openedBoxes[key];
+    } on HiveError {
+      // Open with some value type other than dynamic — out of our reach.
+      return null;
+    }
+  }
+
+  /// Thrown when a box is open with a value type we cannot address.
+  Never _throwUnadoptable(String name) => throw BoxTypeMismatchException(
+        name,
+        wanted: 'a dynamic box',
+        actual: 'a typed box opened outside BaabaStorage',
+        hint: 'Open it with BaabaStorage.hive.openTypedBox<T>("$name") so '
+            'BaabaStorage can track it, or use the Box<T> that Hive returned.',
+      );
+
+  /// Internal helper for every operation that exists on both `Box` and
+  /// `LazyBox` — i.e. everything declared on [BoxBase]: put, putAll, delete,
+  /// deleteAll, clear, keys, containsKey, length, isEmpty, watch, close.
+  ///
+  /// These are legal on a lazy box, so routing them through [BoxBase] rather
+  /// than [Box] is what makes lazy boxes usable through this wrapper at all.
+  BoxBase<dynamic> _boxBase(String name) {
     _ensureInitialized();
-    // Hive requires the box to be open before any read/write.
-    if (!Hive.isBoxOpen(name)) throw BoxNotOpenException(name);
-    // Hive.box(name) with no type param returns Box<dynamic>.
-    return Hive.box(name);
+    final entry = _lookup(name);
+    if (entry != null) return entry.box;
+    if (Hive.isBoxOpen(name)) _throwUnadoptable(name);
+    throw BoxNotOpenException(name);
+  }
+
+  /// Internal helper for the three operations that only a regular [Box] can
+  /// serve — `get`, `getAll` and `listenable` — because they hand back values
+  /// synchronously, which a lazy box cannot do.
+  ///
+  /// A typed `Box<T>` is fine here: reading from it through a `Box<dynamic>`
+  /// view is safe, it is only writes that have to respect T.
+  ///
+  /// [operation] names the caller for the error message, e.g. `'get()'`.
+  Box<dynamic> _box(String name, String operation) {
+    final box = _boxBase(name);
+    if (box is! Box<dynamic>) throw BoxIsLazyException(name, operation);
+    return box;
   }
 
   // ── Adapter registration ──────────────────────────────────────────────────
@@ -125,11 +219,26 @@ class HiveStorage {
   ///
   /// Example:
   ///   await BaabaStorage.hive.openBox('settings');
+  ///
+  /// Throws [BoxTypeMismatchException] if [name] is already open as a lazy box
+  /// or as a typed box.
   Future<Box<dynamic>> openBox(String name) async {
     _ensureInitialized();
     // If the box is already open (e.g. called twice), just return it.
-    if (Hive.isBoxOpen(name)) return Hive.box(name);
-    return Hive.openBox(name);
+    final existing = _lookup(name);
+    if (existing != null) {
+      if (existing.box is! Box<dynamic> || existing.valueType != dynamic) {
+        throw BoxTypeMismatchException(
+          name,
+          wanted: 'a regular box',
+          actual: existing.describe(),
+          hint: 'Use ${existing.opener(name)}, or close the box first.',
+        );
+      }
+      return existing.box as Box<dynamic>;
+    }
+    if (Hive.isBoxOpen(name)) _throwUnadoptable(name);
+    return _remember(name, await Hive.openBox<dynamic>(name), dynamic);
   }
 
   /// Opens (or returns the already-open) typed box named [name].
@@ -143,16 +252,64 @@ class HiveStorage {
   ///   await BaabaStorage.hive.openTypedBox`<UserProfile>`('profiles');
   Future<Box<E>> openTypedBox<E>(String name) async {
     _ensureInitialized();
-    if (Hive.isBoxOpen(name)) return Hive.box<E>(name);
-    return Hive.openBox<E>(name);
+    final key = _key(name);
+
+    final tracked = _openedBoxes[key];
+    if (tracked != null && tracked.box.isOpen) {
+      final box = tracked.box;
+      if (box is! Box<E> || tracked.valueType != E) {
+        throw BoxTypeMismatchException(
+          name,
+          wanted: 'Box<$E>',
+          actual: tracked.describe(),
+          hint: 'Close the box before reopening it with another type.',
+        );
+      }
+      return box;
+    }
+    _openedBoxes.remove(key);
+
+    // Opened elsewhere — let Hive resolve it against the requested type.
+    if (Hive.isBoxOpen(key)) {
+      try {
+        return _remember(key, Hive.box<E>(key), E);
+      } on HiveError catch (e) {
+        throw BoxTypeMismatchException(
+          name,
+          wanted: 'Box<$E>',
+          actual: 'a box of another type',
+          hint: e.message,
+        );
+      }
+    }
+    return _remember(key, await Hive.openBox<E>(name), E);
   }
 
   /// Opens a lazy box — values are only read from disk when accessed,
   /// making it more memory-efficient for large data sets.
+  ///
+  /// Every write and metadata operation on this wrapper works on a lazy box.
+  /// Reads must use the async [getLazy] / [getAllLazy]; the synchronous [get],
+  /// [getAll] and [listenable] throw [BoxIsLazyException].
+  ///
+  /// Throws [BoxTypeMismatchException] if [name] is already open eagerly.
   Future<LazyBox<dynamic>> openLazyBox(String name) async {
     _ensureInitialized();
-    if (Hive.isBoxOpen(name)) return Hive.lazyBox(name);
-    return Hive.openLazyBox(name);
+    final existing = _lookup(name);
+    if (existing != null) {
+      final box = existing.box;
+      if (box is! LazyBox<dynamic> || existing.valueType != dynamic) {
+        throw BoxTypeMismatchException(
+          name,
+          wanted: 'a lazy box',
+          actual: existing.describe(),
+          hint: 'Use ${existing.opener(name)}, or close the box first.',
+        );
+      }
+      return box;
+    }
+    if (Hive.isBoxOpen(name)) _throwUnadoptable(name);
+    return _remember(name, await Hive.openLazyBox<dynamic>(name), dynamic);
   }
 
   /// Returns `true` if the box with [name] is currently open.
@@ -161,19 +318,40 @@ class HiveStorage {
     return Hive.isBoxOpen(name);
   }
 
+  /// Returns `true` if [name] is open *and* was opened lazily.
+  ///
+  /// Use this when generic code needs to choose between [get] and [getLazy].
+  /// Returns `false` for a box that is not open.
+  bool isBoxLazy(String name) {
+    _ensureInitialized();
+    return _lookup(name)?.box.lazy ?? false;
+  }
+
   /// Closes the box with [name], flushing any pending writes to disk.
   /// Does nothing if the box is already closed.
+  ///
+  /// Works on lazy and typed boxes as well as plain ones — this is the call a
+  /// "log out and clear storage" path usually reaches for.
   Future<void> closeBox(String name) async {
-    if (Hive.isBoxOpen(name)) await Hive.box(name).close();
+    final entry = _lookup(name);
+    _openedBoxes.remove(_key(name));
+    if (entry != null) await entry.box.close();
   }
 
   /// Permanently deletes the box file from disk.
   /// All data in that box is lost and cannot be recovered.
-  Future<void> deleteBox(String name) => Hive.deleteBoxFromDisk(name);
+  Future<void> deleteBox(String name) async {
+    _ensureInitialized();
+    _openedBoxes.remove(_key(name));
+    await Hive.deleteBoxFromDisk(name);
+  }
 
   /// Closes all open boxes. Call this when the app is shutting down
   /// to ensure all data is safely flushed to disk.
-  Future<void> closeAll() => Hive.close();
+  Future<void> closeAll() async {
+    _openedBoxes.clear();
+    await Hive.close();
+  }
 
   // ── Data operations ───────────────────────────────────────────────────────
 
@@ -185,15 +363,20 @@ class HiveStorage {
   /// Example:
   ///   await BaabaStorage.hive.put('settings', 'fontSize', 16.0);
   Future<void> put<E>(String boxName, dynamic key, E value) =>
-      _box(boxName).put(key, value);
+      _boxBase(boxName).put(key, value);
 
   /// Stores multiple key/value pairs in [boxName] in a single write operation.
   /// More efficient than calling [put] in a loop.
   ///
+  /// [E] is normally inferred from [entries]. It is generic rather than
+  /// `Map<dynamic, dynamic>` so that a typed box works too: Hive checks the map
+  /// against the box's value type as a whole, and a `Map<dynamic, dynamic>`
+  /// never satisfies a `Box<UserProfile>` even when every value is one.
+  ///
   /// Example:
   ///   await BaabaStorage.hive.putAll('config', {'a': 1, 'b': 2, 'c': 3});
-  Future<void> putAll(String boxName, Map<dynamic, dynamic> entries) =>
-      _box(boxName).putAll(entries);
+  Future<void> putAll<E>(String boxName, Map<dynamic, E> entries) =>
+      _boxBase(boxName).putAll(entries);
 
   /// Reads the value stored under [key] in [boxName] and casts it to [E].
   ///
@@ -201,12 +384,37 @@ class HiveStorage {
   ///   - the key does not exist in the box
   ///   - the stored value cannot be cast to [E]
   ///
+  /// Not available on a lazy box — throws [BoxIsLazyException]. Use [getLazy].
+  ///
   /// Example:
   ///   final theme = BaabaStorage.hive.get`<String>`('settings', 'theme', defaultValue: 'light');
   E? get<E>(String boxName, dynamic key, {E? defaultValue}) {
     // Retrieve raw value (untyped) from the box.
-    final raw = _box(boxName).get(key);
+    final raw = _box(boxName, 'get()').get(key);
 
+    return _cast<E>(raw, defaultValue);
+  }
+
+  /// Reads the value stored under [key] in [boxName] and casts it to [E],
+  /// awaiting the disk read that a lazy box defers until now.
+  ///
+  /// Works on both lazy and regular boxes, so code that does not know (or care)
+  /// how a box was opened can always use this. Returns [defaultValue] on a
+  /// missing key or a type mismatch, exactly like [get].
+  ///
+  /// Example:
+  ///   await BaabaStorage.hive.openLazyBox('blobs');
+  ///   final blob = await BaabaStorage.hive.getLazy`<String>`('blobs', 'report');
+  Future<E?> getLazy<E>(String boxName, dynamic key, {E? defaultValue}) async {
+    final box = _boxBase(boxName);
+    final raw =
+        box is LazyBox<dynamic> ? await box.get(key) : (box as Box<dynamic>).get(key);
+
+    return _cast<E>(raw, defaultValue);
+  }
+
+  /// Shared cast used by [get] and [getLazy].
+  static E? _cast<E>(dynamic raw, E? defaultValue) {
     if (raw == null) return defaultValue;
 
     try {
@@ -220,36 +428,62 @@ class HiveStorage {
 
   /// Removes the entry with [key] from [boxName].
   Future<void> delete(String boxName, dynamic key) =>
-      _box(boxName).delete(key);
+      _boxBase(boxName).delete(key);
 
   /// Removes all entries whose keys are in [keys] from [boxName].
   Future<void> deleteKeys(String boxName, Iterable<dynamic> keys) =>
-      _box(boxName).deleteAll(keys);
+      _boxBase(boxName).deleteAll(keys);
 
   /// Removes every entry from [boxName].
   /// Returns the number of entries that were deleted.
   /// The box itself remains open and can be reused.
-  Future<int> clearBox(String boxName) => _box(boxName).clear();
+  Future<int> clearBox(String boxName) => _boxBase(boxName).clear();
 
   /// Returns all values stored in [boxName], cast to [E].
   ///
+  /// Not available on a lazy box — throws [BoxIsLazyException]. Use [getAllLazy].
+  ///
   /// Example:
   ///   final allScores = BaabaStorage.hive.getAll`<int>`('scores');
-  Iterable<E> getAll<E>(String boxName) => _box(boxName).values.cast<E>();
+  Iterable<E> getAll<E>(String boxName) =>
+      _box(boxName, 'getAll()').values.cast<E>();
+
+  /// Returns all values stored in [boxName], reading each one from disk.
+  ///
+  /// Works on both lazy and regular boxes. Unlike [getAll], which casts lazily
+  /// and throws on the first value that is not an [E], this **skips** values of
+  /// the wrong type — a lazy box has already paid for the read by the time the
+  /// mismatch is visible, and skipping keeps one bad row from killing the scan.
+  ///
+  /// Example:
+  ///   final pending = await BaabaStorage.hive.getAllLazy`<String>`('queue');
+  Future<List<E>> getAllLazy<E>(String boxName) async {
+    final box = _boxBase(boxName);
+    if (box is! LazyBox<dynamic>) {
+      return (box as Box<dynamic>).values.cast<E>().toList();
+    }
+
+    final values = <E>[];
+    for (final key in box.keys) {
+      final raw = await box.get(key);
+      if (raw is E) values.add(raw);
+    }
+    return values;
+  }
 
   /// Returns all keys in [boxName].
   /// Keys can be Strings or ints depending on how data was stored.
-  Iterable<dynamic> getKeys(String boxName) => _box(boxName).keys;
+  Iterable<dynamic> getKeys(String boxName) => _boxBase(boxName).keys;
 
   /// Returns `true` if [key] exists in [boxName].
   bool containsKey(String boxName, dynamic key) =>
-      _box(boxName).containsKey(key);
+      _boxBase(boxName).containsKey(key);
 
   /// Returns the number of entries currently stored in [boxName].
-  int length(String boxName) => _box(boxName).length;
+  int length(String boxName) => _boxBase(boxName).length;
 
   /// Returns `true` if [boxName] has no entries.
-  bool isEmpty(String boxName) => _box(boxName).isEmpty;
+  bool isEmpty(String boxName) => _boxBase(boxName).isEmpty;
 
   // ── Reactive helpers ──────────────────────────────────────────────────────
   // These allow your UI to react automatically when Hive data changes,
@@ -265,7 +499,7 @@ class HiveStorage {
   ///     print('Key ${event.key} changed to ${event.value}');
   ///   });
   Stream<BoxEvent> watch(String boxName, {dynamic key}) =>
-      _box(boxName).watch(key: key);
+      _boxBase(boxName).watch(key: key);
 
   /// Returns a [ValueListenable] for use with [ValueListenableBuilder].
   ///
@@ -279,9 +513,37 @@ class HiveStorage {
   ///       return Text(box.get('theme') ?? 'light');
   ///     },
   ///   );
+  /// Not available on a lazy box — throws [BoxIsLazyException]. Listen with
+  /// [watch] instead and read values through [getLazy].
   ValueListenable<Box<dynamic>> listenable(
     String boxName, {
     List<dynamic>? keys,
   }) =>
-      _box(boxName).listenable(keys: keys);
+      _box(boxName, 'listenable()').listenable(keys: keys);
+}
+
+/// One open box, plus the value type it was opened with.
+///
+/// The type has to be carried alongside the box because Dart generics are
+/// covariant: `Box<UserProfile> is Box<dynamic>` is `true`, so the box object
+/// alone cannot tell us whether `openBox` may hand it out as a dynamic box.
+class _OpenBox {
+  const _OpenBox(this.box, this.valueType);
+
+  final BoxBase<dynamic> box;
+
+  /// The `E` in `Box<E>` / `LazyBox<E>`, i.e. `dynamic` for an untyped box.
+  final Type valueType;
+
+  /// How this box is open, phrased for an exception message.
+  String describe() {
+    if (valueType == dynamic) return box.lazy ? 'a lazy box' : 'a regular box';
+    return box.lazy ? 'LazyBox<$valueType>' : 'Box<$valueType>';
+  }
+
+  /// The call that would return this box, suggested in an exception message.
+  String opener(String name) {
+    if (valueType != dynamic) return 'openTypedBox<$valueType>("$name")';
+    return box.lazy ? 'openLazyBox("$name")' : 'openBox("$name")';
+  }
 }
