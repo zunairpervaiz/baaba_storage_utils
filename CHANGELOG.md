@@ -1,3 +1,93 @@
+## 1.3.0
+
+### Added — encryption at rest for Hive boxes
+
+A Hive box was previously always a cleartext file in the app's data directory,
+and the wrapper offered no way to change that: `Hive.openBox` accepts an
+`encryptionCipher`, but none of `openBox`, `openTypedBox` or `openLazyBox`
+passed one through. An app storing PII on-device had no route to an encrypted
+box except bypassing this package.
+
+All three openers now take an optional cipher:
+
+```dart
+await BaabaStorage.hive.openBox(
+  'citizens',
+  encryptionCipher: await BaabaStorage.hiveCipher(),
+);
+```
+
+| API | Purpose |
+|---|---|
+| `hive.openBox(name, {encryptionCipher, crashRecovery})` | Open a regular box, optionally AES-256 encrypted |
+| `hive.openTypedBox<E>(name, {encryptionCipher, crashRecovery})` | Same, for a box of custom objects |
+| `hive.openLazyBox(name, {encryptionCipher, crashRecovery})` | Same, for a lazy box |
+| `BaabaStorage.hiveCipher({key})` | Resolves a stable per-install AES-256 key out of Keystore-backed secure storage, generating one from a CSPRNG on first use. Memoised and single-flight, so concurrent opens cannot race into generating two keys |
+| `BaabaStorage.hiveKeyAlias` | The secure-storage key `hiveCipher` uses, so consumers need not hardcode it |
+| `hive.boxExistsOnDisk(name)` | Whether a file exists for a box, without opening it — the only way to tell "first run" from "the box is here but its key is gone", which need opposite handling |
+| `BoxEncryptionMismatchException` | Thrown when a box is already open with a different encryption intent than the one requested |
+
+The package now also re-exports `HiveCipher` and `HiveAesCipher`, so a consumer
+can name those types without adding `hive` to its own pubspec.
+
+### Fixed — the already-open box silently ignored the cipher
+
+Hive documents that on an already-open box "all provided parameters are being
+ignored", and that includes `encryptionCipher`. Every opener here short-circuits
+on an open box, so this returned a plaintext box with no error and no
+encryption:
+
+```dart
+await BaabaStorage.hive.openBox('citizens');                    // cleartext
+await BaabaStorage.hive.openBox(                                // same box!
+  'citizens',
+  encryptionCipher: await BaabaStorage.hiveCipher(),
+);
+```
+
+`HiveStorage` now records the encryption intent of every box it opens and throws
+`BoxEncryptionMismatchException` when a later open disagrees, in either
+direction. A box adopted from a bare `Hive.openBox` elsewhere in the app counts
+as *unknown* rather than unencrypted: requesting it plaintext behaves exactly as
+before, requesting it encrypted throws, because an unverifiable claim of
+encryption is not one this package will make.
+
+### Changed — `crashRecovery` defaults to `false` on an encrypted open
+
+Only affects the new ciphered code path; a call without a cipher is unchanged.
+
+Hive computes each frame's checksum over the encryption key, so opening a
+cleartext box with a cipher — or an encrypted box with the wrong key — fails the
+checksum on the first frame. Hive's `crashRecovery` default of `true` reads that
+as a corrupt file, **truncates it, and returns an empty box without throwing**.
+For a damaged cleartext cache that is a reasonable trade. For an encrypted box,
+where a key that does not match is far more likely than a damaged file, it turns
+a recoverable problem into silent, permanent data loss.
+
+A ciphered open therefore defaults to `crashRecovery: false`, which raises a
+`HiveError` and leaves the file untouched. Pass the flag explicitly to get
+Hive's behaviour back.
+
+Note this protection cannot extend across sessions: nothing in a `.hive` file
+records whether it is encrypted, so opening an encrypted box *without* its
+cipher still looks like corruption to Hive and still truncates. Resolve the
+cipher once at startup and pass it to every open of that box.
+
+### Notes for adopting encryption on existing data
+
+Two things a consumer must handle, both documented in the README:
+
+* **A cleartext box cannot be reopened with a cipher.** Adding the parameter to
+  a box that already holds data does not migrate it. Migration — read plaintext,
+  write to a new encrypted box, then delete the original — belongs in the app,
+  and the order matters.
+* **`android:allowBackup` must be `false`.** The `.hive` files travel in an
+  Android Auto Backup; the Keystore-backed key does not. A restore onto a new
+  device would produce encrypted boxes with no key to decrypt them.
+
+Backward compatible: every new parameter is optional and named, and no existing
+call site changes behaviour.
+
 ## 1.2.0
 
 ### Fixed — lazy and typed boxes were unusable through the wrapper

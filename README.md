@@ -5,7 +5,7 @@ A unified Flutter storage package that wraps **SharedPreferences**, **Hive**, an
 | Storage | Best for | Reactive? |
 |---|---|---|
 | `BaabaStorage.prefs` | Simple flags, settings, primitive values | ✅ `watch` / `listenable` |
-| `BaabaStorage.hive` | Lists, maps, custom objects | ✅ `watch` / `listenable` |
+| `BaabaStorage.hive` | Lists, maps, custom objects — optionally AES-256 encrypted at rest | ✅ `watch` / `listenable` |
 | `BaabaStorage.secure` | Tokens, API keys, passwords | — |
 
 ---
@@ -200,6 +200,115 @@ await BaabaStorage.hive.openLazyBox('queue');
 await BaabaStorage.hive.openBox('queue');  // throws BoxTypeMismatchException
 ```
 
+### Encrypting Hive boxes
+
+A Hive box is a plain file in the app's data directory. Anything in it — an ID
+number, a biometric template, a health record — is readable by anyone who can
+read that file: a rooted or jailbroken device, an ADB backup, a stolen phone, a
+forensic image. Pass a cipher to encrypt the box with AES-256 at rest:
+
+```dart
+await BaabaStorage.hive.openBox(
+  'citizens',
+  encryptionCipher: await BaabaStorage.hiveCipher(),
+);
+```
+
+`openTypedBox` and `openLazyBox` take the same parameter. Everything after the
+open is unchanged — `put`, `get`, `watch` and the rest behave exactly as they do
+on a plaintext box.
+
+`BaabaStorage.hiveCipher()` resolves a stable per-install AES-256 key: it reads
+one from secure storage, generating it from a CSPRNG on first use. The key lives
+in the platform's secure enclave (Android Keystore, iOS Keychain, DPAPI,
+libsecret), which is the point — a key kept next to the data it protects, in
+SharedPreferences or in another Hive box, encrypts nothing in practice. The key
+is never logged or exposed; you get an opaque cipher. Repeated calls return the
+same one, so calling it per box is fine.
+
+Encrypt what needs it: PII, credentials, anything regulated. A cache of public
+reference data does not need a cipher, and encryption is not free — every read
+and write pays for it.
+
+> ⚠️ **An existing cleartext box cannot be reopened with a cipher.**
+>
+> Hive folds the encryption key into every frame's checksum, so a file written
+> in the clear fails to decode under a cipher. Adding `encryptionCipher:` to a
+> box that already holds data does not migrate it — the open throws, and if you
+> pass `crashRecovery: true` it silently truncates the file instead. Adopting
+> encryption on live data means migrating it yourself:
+>
+> ```dart
+> // 1. Read the cleartext box.
+> final old = await BaabaStorage.hive.openBox('citizens');
+> final entries = {for (final k in old.keys) k: old.get(k)};
+> await BaabaStorage.hive.closeBox('citizens');
+>
+> // 2. Write it into a new, encrypted box — a NEW NAME, so the original stays
+> //    intact until the copy is safely on disk.
+> await BaabaStorage.hive.openBox(
+>   'citizens_enc',
+>   encryptionCipher: await BaabaStorage.hiveCipher(),
+> );
+> await BaabaStorage.hive.putAll('citizens_enc', entries);
+> await BaabaStorage.hive.closeBox('citizens_enc');
+>
+> // 3. Only now delete the original, and record that the migration ran so a
+> //    half-finished attempt can be resumed rather than repeated blindly.
+> await BaabaStorage.hive.deleteBox('citizens');
+> await BaabaStorage.prefs.setBool('citizens_migrated', true);
+> ```
+>
+> Migrate in that order. Deleting before the encrypted copy is closed loses the
+> data if the app is killed mid-way.
+
+> ⚠️ **Set `android:allowBackup="false"`.**
+>
+> ```xml
+> <application android:allowBackup="false" android:fullBackupContent="false">
+> ```
+>
+> The `.hive` files are ordinary app data and travel in an Android Auto Backup.
+> The Keystore-backed key does not — Keystore keys never leave the device. A
+> restore onto a new phone therefore yields encrypted boxes and no key to
+> decrypt them. Without this flag, encryption converts a confidentiality risk
+> into permanent, unrecoverable data loss for the user.
+>
+> On iOS the trade-off differs: Keychain items are included in encrypted device
+> and iCloud backups, so a restore usually keeps the key. Do not rely on it for
+> data you cannot re-fetch.
+
+**Every open of an encrypted box must pass the cipher.** Within one session the
+wrapper enforces this: a second open whose encryption intent disagrees with the
+first throws `BoxEncryptionMismatchException` instead of quietly returning a box
+that is not what was asked for — Hive itself ignores `encryptionCipher` on an
+already-open box, which is what makes that guard necessary. Across sessions
+nothing can enforce it, because a `.hive` file does not record whether it is
+encrypted: opening an encrypted box with no cipher looks like a corrupt file to
+Hive, and under its `crashRecovery` default the file is truncated and the data is
+gone, with no error raised. Resolve the cipher once at startup and use it for
+every open of that box.
+
+**When the key is missing.** Use `boxExistsOnDisk` to tell a first run apart from
+a box whose key is gone — a restored device, a wiped Keystore — because those
+need opposite responses and are otherwise indistinguishable:
+
+```dart
+final onDisk = await BaabaStorage.hive.boxExistsOnDisk('citizens');
+final hasKey = await BaabaStorage.secure.containsKey(BaabaStorage.hiveKeyAlias);
+
+if (onDisk && !hasKey) {
+  // Encrypted data that can no longer be read. Tell the user and re-fetch, or
+  // delete the box deliberately with deleteBox. Do NOT generate a new key and
+  // open it anyway — that destroys the file.
+}
+```
+
+`hiveCipher()` never replaces a key that is present but unreadable; it throws a
+`StorageException` instead, because generating a replacement would make every
+box encrypted with the original permanently unrecoverable.
+
+### Reactive UI with ValueListenableBuilder
 ### Reactive UI with ValueListenableBuilder
 
 ```dart
@@ -312,7 +421,9 @@ await BaabaStorage.dispose();
 | `BoxNotOpenException` | `hive.get/put/delete` called on a box that was never opened |
 | `BoxIsLazyException` | `hive.get`, `getAll` or `listenable` called on a lazy box — use `getLazy` / `getAllLazy` |
 | `BoxTypeMismatchException` | A box name is already open in another flavour (lazy vs regular, or a different value type) |
+| `BoxEncryptionMismatchException` | A box name is already open with a different encryption intent than the one requested — including a box opened outside `BaabaStorage`, whose cipher cannot be verified |
 | `UnsupportedTypeException` | `prefs.set<T>` called with an unsupported type |
+| `HiveError` | Passed through from Hive when an encrypted box cannot be decoded with the cipher given — a wrong key, or a cleartext file. Note hive 2.2.3 also logs this error a second time as an unhandled async error |
 
 ```dart
 try {

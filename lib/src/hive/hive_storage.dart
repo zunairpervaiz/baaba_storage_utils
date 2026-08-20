@@ -101,9 +101,19 @@ class HiveStorage {
   /// bookkeeping can never drift from Hive's.
   static String _key(String name) => name.toLowerCase();
 
-  /// Records [box] — opened with value type [valueType] — and returns it.
-  B _remember<B extends BoxBase<dynamic>>(String name, B box, Type valueType) {
-    _openedBoxes[_key(name)] = _OpenBox(box, valueType);
+  /// Records [box] — opened with value type [valueType] and encryption intent
+  /// [encrypted] — and returns it.
+  ///
+  /// [encrypted] is `null` for a box this wrapper adopted rather than opened
+  /// itself: Hive gives us no way to ask an open box whether it has a cipher,
+  /// so "unknown" is the only honest answer there. See [_checkEncryption].
+  B _remember<B extends BoxBase<dynamic>>(
+    String name,
+    B box,
+    Type valueType,
+    bool? encrypted,
+  ) {
+    _openedBoxes[_key(name)] = _OpenBox(box, valueType, encrypted);
     return box;
   }
 
@@ -131,13 +141,13 @@ class HiveStorage {
     // Open, but not by us. Probe both flavours; at most one can succeed, and
     // only for a dynamic box — the probes ask for value type dynamic.
     try {
-      _remember(key, Hive.box<dynamic>(key), dynamic);
+      _remember(key, Hive.box<dynamic>(key), dynamic, null);
       return _openedBoxes[key];
     } on HiveError {
       // Not an eager dynamic box.
     }
     try {
-      _remember(key, Hive.lazyBox<dynamic>(key), dynamic);
+      _remember(key, Hive.lazyBox<dynamic>(key), dynamic, null);
       return _openedBoxes[key];
     } on HiveError {
       // Open with some value type other than dynamic — out of our reach.
@@ -153,6 +163,56 @@ class HiveStorage {
         hint: 'Open it with BaabaStorage.hive.openTypedBox<T>("$name") so '
             'BaabaStorage can track it, or use the Box<T> that Hive returned.',
       );
+
+  // ── Encryption bookkeeping ────────────────────────────────────────────────
+  //
+  // Hive's own openBox short-circuits on an already-open box and, in its words,
+  // "all provided parameters are being ignored" — encryptionCipher included.
+  // For every other parameter that is merely surprising; for a cipher it is a
+  // confidentiality hole, because the caller gets a plaintext box back and no
+  // indication that the encryption they asked for did not happen.
+  //
+  // So the flavour we record per box (see [_OpenBox]) carries its encryption
+  // intent too, and every opener checks the request against it.
+
+  /// Throws [BoxEncryptionMismatchException] if reusing an already-open box
+  /// whose encryption intent was [actual] would not honour a request made with
+  /// [cipher].
+  ///
+  /// `actual == null` is the adopted-box case — open, but not opened by us, so
+  /// its cipher is unknowable. Requesting encryption on such a box throws: an
+  /// unverifiable claim of encryption is not one this package will make.
+  /// Requesting a plaintext box does not, which is what keeps every pre-1.3.0
+  /// call site behaving exactly as it did.
+  void _checkEncryption(String name, bool? actual, HiveCipher? cipher) {
+    final wanted = cipher != null;
+    if (actual == wanted) return;
+    if (actual == null && !wanted) return;
+    throw BoxEncryptionMismatchException(
+      name,
+      wantedEncrypted: wanted,
+      actualEncrypted: actual,
+    );
+  }
+
+  /// Resolves the `crashRecovery` flag handed to Hive.
+  ///
+  /// Hive defaults this to `true`, and the consequence is not what the name
+  /// suggests. A box's frame checksums are computed over the encryption key
+  /// (`cipher.calculateKeyCrc()`), so opening a cleartext box with a cipher —
+  /// or an encrypted box with the wrong key — fails the checksum on the very
+  /// first frame. With crash recovery on, Hive treats that as corruption,
+  /// truncates the file to the last good offset (zero, here) and hands back an
+  /// empty box. No exception is thrown: the data is simply gone.
+  ///
+  /// That is an acceptable trade for a genuinely corrupt cleartext cache, and a
+  /// catastrophic one for an encrypted box, where a key that does not match is
+  /// overwhelmingly more likely than a damaged file — a Keystore entry lost to
+  /// a device restore, say. So a ciphered open defaults to `false`, turning
+  /// silent data loss into a `HiveError` the caller can act on. Callers who
+  /// want Hive's default can still pass it explicitly.
+  static bool _resolveCrashRecovery(bool? crashRecovery, HiveCipher? cipher) =>
+      crashRecovery ?? (cipher == null);
 
   /// Internal helper for every operation that exists on both `Box` and
   /// `LazyBox` — i.e. everything declared on [BoxBase]: put, putAll, delete,
@@ -220,9 +280,39 @@ class HiveStorage {
   /// Example:
   ///   await BaabaStorage.hive.openBox('settings');
   ///
+  /// **Encryption.** Pass [encryptionCipher] to store the box AES-256 encrypted
+  /// on disk — the fix for a box holding anything a device thief should not be
+  /// able to read (identity documents, biometrics, health data). Keys, tokens
+  /// and PII belong behind a cipher; a cache of public reference data does not
+  /// need one. [BaabaStorage.hiveCipher] resolves a per-install key out of
+  /// Keystore-backed secure storage:
+  ///
+  /// ```dart
+  /// await BaabaStorage.hive.openBox(
+  ///   'citizens',
+  ///   encryptionCipher: await BaabaStorage.hiveCipher(),
+  /// );
+  /// ```
+  ///
+  /// **A box that already holds cleartext data cannot simply be reopened with a
+  /// cipher.** Hive folds the encryption key into every frame's checksum, so an
+  /// existing plaintext file fails to decode and the open throws. Adopting
+  /// encryption on live data means migrating it: read every entry from the
+  /// plaintext box, write it to a new encrypted box, then delete the original.
+  /// Adding the parameter on its own does not migrate anything.
+  ///
+  /// [crashRecovery] defaults to `false` when a cipher is supplied and `true`
+  /// otherwise — see [_resolveCrashRecovery] for why that difference matters
+  /// far more than it looks.
+  ///
   /// Throws [BoxTypeMismatchException] if [name] is already open as a lazy box
-  /// or as a typed box.
-  Future<Box<dynamic>> openBox(String name) async {
+  /// or as a typed box, and [BoxEncryptionMismatchException] if it is already
+  /// open with a different encryption intent than the one requested here.
+  Future<Box<dynamic>> openBox(
+    String name, {
+    HiveCipher? encryptionCipher,
+    bool? crashRecovery,
+  }) async {
     _ensureInitialized();
     // If the box is already open (e.g. called twice), just return it.
     final existing = _lookup(name);
@@ -235,10 +325,20 @@ class HiveStorage {
           hint: 'Use ${existing.opener(name)}, or close the box first.',
         );
       }
+      _checkEncryption(name, existing.encrypted, encryptionCipher);
       return existing.box as Box<dynamic>;
     }
     if (Hive.isBoxOpen(name)) _throwUnadoptable(name);
-    return _remember(name, await Hive.openBox<dynamic>(name), dynamic);
+    return _remember(
+      name,
+      await Hive.openBox<dynamic>(
+        name,
+        encryptionCipher: encryptionCipher,
+        crashRecovery: _resolveCrashRecovery(crashRecovery, encryptionCipher),
+      ),
+      dynamic,
+      encryptionCipher != null,
+    );
   }
 
   /// Opens (or returns the already-open) typed box named [name].
@@ -250,7 +350,15 @@ class HiveStorage {
   /// Example:
   ///   BaabaStorage.hive.registerAdapter(UserProfileAdapter());
   ///   await BaabaStorage.hive.openTypedBox`<UserProfile>`('profiles');
-  Future<Box<E>> openTypedBox<E>(String name) async {
+  ///
+  /// Pass [encryptionCipher] to encrypt the box at rest — the same rules and
+  /// the same migration caveat as [openBox], which documents both. A box of
+  /// custom objects is the usual home for the PII worth encrypting.
+  Future<Box<E>> openTypedBox<E>(
+    String name, {
+    HiveCipher? encryptionCipher,
+    bool? crashRecovery,
+  }) async {
     _ensureInitialized();
     final key = _key(name);
 
@@ -265,14 +373,18 @@ class HiveStorage {
           hint: 'Close the box before reopening it with another type.',
         );
       }
+      _checkEncryption(name, tracked.encrypted, encryptionCipher);
       return box;
     }
     _openedBoxes.remove(key);
 
-    // Opened elsewhere — let Hive resolve it against the requested type.
+    // Opened elsewhere — let Hive resolve it against the requested type. Its
+    // cipher is unknowable, so the box is recorded as such and the encryption
+    // check decides whether it can be handed out for this request.
     if (Hive.isBoxOpen(key)) {
+      final Box<E> adopted;
       try {
-        return _remember(key, Hive.box<E>(key), E);
+        adopted = _remember(key, Hive.box<E>(key), E, null);
       } on HiveError catch (e) {
         throw BoxTypeMismatchException(
           name,
@@ -281,8 +393,19 @@ class HiveStorage {
           hint: e.message,
         );
       }
+      _checkEncryption(name, null, encryptionCipher);
+      return adopted;
     }
-    return _remember(key, await Hive.openBox<E>(name), E);
+    return _remember(
+      key,
+      await Hive.openBox<E>(
+        name,
+        encryptionCipher: encryptionCipher,
+        crashRecovery: _resolveCrashRecovery(crashRecovery, encryptionCipher),
+      ),
+      E,
+      encryptionCipher != null,
+    );
   }
 
   /// Opens a lazy box — values are only read from disk when accessed,
@@ -292,8 +415,19 @@ class HiveStorage {
   /// Reads must use the async [getLazy] / [getAllLazy]; the synchronous [get],
   /// [getAll] and [listenable] throw [BoxIsLazyException].
   ///
-  /// Throws [BoxTypeMismatchException] if [name] is already open eagerly.
-  Future<LazyBox<dynamic>> openLazyBox(String name) async {
+  /// Pass [encryptionCipher] to encrypt the box at rest — the same rules and
+  /// the same migration caveat as [openBox], which documents both. A lazy box
+  /// pays the decryption cost per read rather than all at once on open, which
+  /// is usually what you want for a large encrypted box.
+  ///
+  /// Throws [BoxTypeMismatchException] if [name] is already open eagerly, and
+  /// [BoxEncryptionMismatchException] if it is already open with a different
+  /// encryption intent than the one requested here.
+  Future<LazyBox<dynamic>> openLazyBox(
+    String name, {
+    HiveCipher? encryptionCipher,
+    bool? crashRecovery,
+  }) async {
     _ensureInitialized();
     final existing = _lookup(name);
     if (existing != null) {
@@ -306,10 +440,54 @@ class HiveStorage {
           hint: 'Use ${existing.opener(name)}, or close the box first.',
         );
       }
+      _checkEncryption(name, existing.encrypted, encryptionCipher);
       return box;
     }
     if (Hive.isBoxOpen(name)) _throwUnadoptable(name);
-    return _remember(name, await Hive.openLazyBox<dynamic>(name), dynamic);
+    return _remember(
+      name,
+      await Hive.openLazyBox<dynamic>(
+        name,
+        encryptionCipher: encryptionCipher,
+        crashRecovery: _resolveCrashRecovery(crashRecovery, encryptionCipher),
+      ),
+      dynamic,
+      encryptionCipher != null,
+    );
+  }
+
+  /// Returns `true` if a file for the box named [name] is present on disk,
+  /// without opening it.
+  ///
+  /// This exists to tell two situations apart that need completely different
+  /// handling, and that are otherwise indistinguishable:
+  ///
+  ///   * **No box, first run.** Nothing on disk. Generate a key, open an
+  ///     encrypted box, carry on.
+  ///   * **Box on disk, key gone.** The `.hive` file is there but the key that
+  ///     decrypts it is not — a restore onto a new device, a wiped Keystore, a
+  ///     cleared app data directory. Opening it with a freshly generated key
+  ///     cannot work and must not be attempted.
+  ///
+  /// In the second case the data is unrecoverable, and the only correct
+  /// responses are to tell the user and re-fetch, or to delete the box
+  /// deliberately with [deleteBox]. What you must not do is generate a new key
+  /// and open the box anyway — see [openBox] on why that can destroy the file.
+  ///
+  /// ```dart
+  /// final onDisk = await BaabaStorage.hive.boxExistsOnDisk('citizens');
+  /// final hasKey = await BaabaStorage.secure.containsKey('baaba_hive_key');
+  /// if (onDisk && !hasKey) {
+  ///   // Encrypted data we can no longer read. Do not open it.
+  /// }
+  /// ```
+  ///
+  /// Note this reports on any file Hive keeps for the name — `.hive`, `.hivec`
+  /// or a leftover `.lock` — so it answers "something is on disk for this box",
+  /// which is the question that matters here.
+  Future<bool> boxExistsOnDisk(String name) async {
+    _ensureInitialized();
+    return Hive.boxExists(name);
   }
 
   /// Returns `true` if the box with [name] is currently open.
@@ -528,12 +706,21 @@ class HiveStorage {
 /// covariant: `Box<UserProfile> is Box<dynamic>` is `true`, so the box object
 /// alone cannot tell us whether `openBox` may hand it out as a dynamic box.
 class _OpenBox {
-  const _OpenBox(this.box, this.valueType);
+  const _OpenBox(this.box, this.valueType, this.encrypted);
 
   final BoxBase<dynamic> box;
 
   /// The `E` in `Box<E>` / `LazyBox<E>`, i.e. `dynamic` for an untyped box.
   final Type valueType;
+
+  /// Whether this box was opened with an [HiveCipher].
+  ///
+  /// `null` means unknown: the box was already open when this wrapper first
+  /// saw it, and Hive exposes nothing that would tell us after the fact whether
+  /// a cipher was involved. That is a third state, not a `false` — treating
+  /// "unknown" as "unencrypted" would let a caller believe a box is plaintext
+  /// when it is not, and treating it as `true` would be worse still.
+  final bool? encrypted;
 
   /// How this box is open, phrased for an exception message.
   String describe() {

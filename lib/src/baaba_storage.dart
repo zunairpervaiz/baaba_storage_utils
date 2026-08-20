@@ -17,8 +17,10 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:hive/hive.dart';
 
 import 'exceptions/storage_exception.dart';
+import 'hive/hive_cipher.dart';
 import 'hive/hive_storage.dart';
 import 'prefs/prefs_storage.dart';
 import 'secure/secure_storage.dart';
@@ -159,6 +161,53 @@ class BaabaStorage {
     return SecureStorage.instance;
   }
 
+  // ── Encryption ────────────────────────────────────────────────────────────
+
+  /// The secure-storage key under which [hiveCipher] keeps its encryption key.
+  ///
+  /// Use this instead of hardcoding the string when you need to check whether
+  /// the key is present:
+  ///   final hasKey = await BaabaStorage.secure.containsKey(BaabaStorage.hiveKeyAlias);
+  static const String hiveKeyAlias = defaultHiveKeyAlias;
+
+  /// Returns the [HiveCipher] that encrypts Hive boxes at rest, resolving a
+  /// stable per-install AES-256 key out of secure storage and generating one on
+  /// first use.
+  ///
+  /// Pass the result to [HiveStorage.openBox], [HiveStorage.openTypedBox] or
+  /// [HiveStorage.openLazyBox]:
+  ///
+  /// ```dart
+  /// await BaabaStorage.hive.openBox(
+  ///   'citizens',
+  ///   encryptionCipher: await BaabaStorage.hiveCipher(),
+  /// );
+  /// ```
+  ///
+  /// The key is generated from a CSPRNG, stored in the platform's secure
+  /// enclave (Keystore / Keychain / DPAPI / libsecret), and never logged or
+  /// exposed — what you get back is an opaque cipher. Repeated calls return the
+  /// same cipher, so it is safe to call once per box rather than threading one
+  /// instance through your app.
+  ///
+  /// [key] is the secure-storage alias, defaulting to [hiveKeyAlias]. Override
+  /// it only if you need independently-keyed sets of boxes; two aliases mean two
+  /// keys, and a box can only ever be opened with the one it was created with.
+  ///
+  /// Requires [init] to have been called — this reaches into secure storage,
+  /// which is configured there. Throws [StorageNotInitializedException]
+  /// otherwise.
+  ///
+  /// Throws [StorageException] if a key is already stored under [key] but is
+  /// not a valid 32-byte base64 value. That case is deliberately *not* repaired
+  /// by generating a new key: any box encrypted with the original would become
+  /// permanently unreadable. See also [HiveStorage.boxExistsOnDisk] for telling
+  /// "first run" apart from "the key for this box is gone".
+  static Future<HiveCipher> hiveCipher({String key = hiveKeyAlias}) {
+    _ensureInitialized();
+    return HiveKeyStore.resolve(key);
+  }
+
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
   /// Closes all open Hive boxes and resets the initialisation flag.
@@ -171,6 +220,10 @@ class BaabaStorage {
     if (!_initialized) return;
     // Close all Hive boxes to flush pending writes to disk.
     await HiveStorage.instance.closeAll();
+    // Drop the memoised encryption ciphers — a subsequent init() may run
+    // against a different secure-storage configuration, and holding a cipher
+    // from the previous lifetime would silently ignore it.
+    HiveKeyStore.clearCache();
     _initialized = false;
   }
 }
