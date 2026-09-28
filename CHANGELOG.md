@@ -1,3 +1,75 @@
+## 2.0.0
+
+### Changed — Hive is now `hive_ce`
+
+The unmaintained `hive` / `hive_flutter` packages (last released 2022) are
+replaced by their maintained community edition, `hive_ce: ^2.20.1` and
+`hive_ce_flutter: ^2.4.0`. The API this package exposes is unchanged, and so is
+the on-disk format: boxes written by `hive` 2.x — plain, encrypted, typed and
+lazy — open and read unchanged, and files written afterwards remain readable by
+`hive` 2.x.
+
+**Breaking for consumers:**
+
+- Minimum SDK is now Dart 3.8 and Flutter 3.44 (required by
+  `flutter_secure_storage` 11 and `hive_ce_flutter`), and Android `minSdk` 24.
+- The re-exported Hive types (`Box`, `LazyBox`, `TypeAdapter`, `HiveAesCipher`,
+  …) now come from `hive_ce`. An app that imports `package:hive/hive.dart`
+  directly must switch to `package:hive_ce/hive_ce.dart`, and `hive_generator`
+  must be replaced with `hive_ce_generator`. Do not keep both `hive` and
+  `hive_ce` in one app: each has its own `Hive` singleton and adapter registry.
+  Check with `flutter pub deps | grep hive`.
+
+### Changed — `flutter_secure_storage` 11
+
+`flutter_secure_storage` moves from `^10.0.0` to `^11.2.0`. v11 removed the
+`encryptedSharedPreferences` Android option, which v10 already ignored after
+migrating its data to AES-GCM storage with a Keystore-wrapped key. The default
+Android options are now plain `AndroidOptions()`, which is that same storage,
+so secrets written through 1.x of this package stay readable.
+
+**Breaking for consumers:**
+
+- Remove `encryptedSharedPreferences:` and `sharedPreferencesName:` from any
+  `AndroidOptions` passed to `BaabaStorage.init` or `SecureStorage.configure`;
+  both no longer compile. Use `storageNamespace` in place of
+  `sharedPreferencesName`.
+- An app that used `flutter_secure_storage` **older than v10** directly, and
+  whose users skip straight to a build on v11, loses those users' secrets:
+  v11 cannot read the pre-v10 formats. Ship a v10 build first, or call
+  `FlutterSecureStorage().checkUpgradeStatus()` to detect the loss.
+
+### Changed — a wrong cipher no longer wipes a box
+
+`hive_ce` throws a `HiveError` when a box's first frame is complete but cannot
+be read — a wrong cipher, or a cipher applied to a cleartext box — instead of
+truncating it under crash recovery. So opening an encrypted box **without** its
+cipher, which 1.3.0 documented as silently destroying the file, now fails and
+leaves the data intact. Crash recovery still trims an incomplete frame at the
+end of the file. The `crashRecovery: false` default for ciphered opens is kept.
+
+### Added
+
+- Re-exports the `flutter_secure_storage` option types that `BaabaStorage.init`
+  and `SecureStorage.configure` take — `AndroidOptions`, `IOSOptions`,
+  `MacOsOptions`, `LinuxOptions`, `WindowsOptions`, `WebOptions` and
+  `KeychainAccessibility` — so customising secure storage no longer needs
+  `flutter_secure_storage` in the consuming app's pubspec.
+
+### Fixed
+
+- A failed box open is now reported once. `hive` 2.2.3 also raised the same
+  `HiveError` a second time as an unhandled async error, which reached an
+  app's zone error handler (and crash reporting) even when the caller caught
+  it; `hive_ce` does not.
+
+### Documentation
+
+- README: an "Upgrading from 1.x" guide; Android `minSdk` 24 (was 18); the
+  Linux `libsecret-1-dev` build requirement; a warning that Android's
+  `resetOnError` default erases every secret — including the Hive encryption
+  key — on a decryption error.
+
 ## 1.3.0
 
 ### Added — encryption at rest for Hive boxes

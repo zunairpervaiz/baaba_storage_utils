@@ -19,7 +19,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import 'package:flutter/foundation.dart';
-import 'package:hive_flutter/hive_flutter.dart';
+import 'package:hive_ce_flutter/hive_ce_flutter.dart';
 
 import '../exceptions/storage_exception.dart';
 
@@ -197,20 +197,22 @@ class HiveStorage {
 
   /// Resolves the `crashRecovery` flag handed to Hive.
   ///
-  /// Hive defaults this to `true`, and the consequence is not what the name
-  /// suggests. A box's frame checksums are computed over the encryption key
-  /// (`cipher.calculateKeyCrc()`), so opening a cleartext box with a cipher —
-  /// or an encrypted box with the wrong key — fails the checksum on the very
-  /// first frame. With crash recovery on, Hive treats that as corruption,
-  /// truncates the file to the last good offset (zero, here) and hands back an
-  /// empty box. No exception is thrown: the data is simply gone.
+  /// Hive defaults this to `true`. A box's frame checksums are computed over
+  /// the encryption key (`cipher.calculateKeyCrc()`), so opening a cleartext
+  /// box with a cipher — or an encrypted box with the wrong key — fails the
+  /// checksum on the very first frame. Original Hive treated that as
+  /// corruption under crash recovery and truncated the file to an empty box,
+  /// silently. hive_ce (2.20.1+) instead throws a `HiveError` when the first
+  /// frame is complete but unreadable, before touching the file, and keeps
+  /// truncation for what a crash can actually leave: an incomplete frame at
+  /// the end.
   ///
-  /// That is an acceptable trade for a genuinely corrupt cleartext cache, and a
-  /// catastrophic one for an encrypted box, where a key that does not match is
-  /// overwhelmingly more likely than a damaged file — a Keystore entry lost to
-  /// a device restore, say. So a ciphered open defaults to `false`, turning
-  /// silent data loss into a `HiveError` the caller can act on. Callers who
-  /// want Hive's default can still pass it explicitly.
+  /// A ciphered open still defaults to `false`, as defence in depth: for an
+  /// encrypted box a key that does not match is overwhelmingly more likely
+  /// than a damaged file — a Keystore entry lost to a device restore, say — so
+  /// any checksum failure should reach the caller as a `HiveError` rather than
+  /// be "recovered" by discarding frames. Callers who want Hive's default can
+  /// still pass it explicitly.
   static bool _resolveCrashRecovery(bool? crashRecovery, HiveCipher? cipher) =>
       crashRecovery ?? (cipher == null);
 
@@ -252,7 +254,7 @@ class HiveStorage {
   /// If [override] is true, replaces an already-registered adapter for the
   /// same typeId — useful during development.
   ///
-  /// Example (using hive_generator):
+  /// Example (using hive_ce_generator):
   ///   BaabaStorage.hive.registerAdapter(UserProfileAdapter());
   void registerAdapter<T>(TypeAdapter<T> adapter, {bool override = false}) {
     _ensureInitialized();
@@ -472,7 +474,8 @@ class HiveStorage {
   /// In the second case the data is unrecoverable, and the only correct
   /// responses are to tell the user and re-fetch, or to delete the box
   /// deliberately with [deleteBox]. What you must not do is generate a new key
-  /// and open the box anyway — see [openBox] on why that can destroy the file.
+  /// and open the box anyway: the open throws, and the old key is still the
+  /// only thing that can ever read the file.
   ///
   /// ```dart
   /// final onDisk = await BaabaStorage.hive.boxExistsOnDisk('citizens');

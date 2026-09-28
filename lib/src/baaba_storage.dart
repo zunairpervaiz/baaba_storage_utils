@@ -17,7 +17,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
-import 'package:hive/hive.dart';
+import 'package:hive_ce/hive_ce.dart';
 
 import 'exceptions/storage_exception.dart';
 import 'hive/hive_cipher.dart';
@@ -78,8 +78,8 @@ class BaabaStorage {
   /// Hive will store its `.hive` files. Leave null to use the root.
   ///
   /// [secureAndroidOptions] through [secureMacOsOptions] — platform-specific
-  /// configuration for Flutter Secure Storage. Sensible defaults are applied
-  /// when these are omitted (e.g. `encryptedSharedPreferences: true` on Android).
+  /// configuration for Flutter Secure Storage. Each platform's OS default is
+  /// used when these are omitted.
   static Future<void> init({
     String? hiveSubDir,
     AndroidOptions? secureAndroidOptions,
