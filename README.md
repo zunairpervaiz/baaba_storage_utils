@@ -20,19 +20,44 @@ dependencies:
     path: ../baaba_storage_utils   # or pub.dev version once published
 ```
 
+Requires Dart 3.8+ and Flutter 3.44+. Hive support comes from
+[`hive_ce`](https://pub.dev/packages/hive_ce), the maintained community edition
+of Hive. Do not also depend on the original `hive` / `hive_flutter` /
+`hive_generator` packages: two Hive copies in one app keep separate adapter
+registries and can open the same box file twice. For generated adapters use
+`hive_ce_generator`:
+
+```yaml
+dev_dependencies:
+  build_runner: any
+  hive_ce_generator: any
+```
+
 ### 2. Android — minimum SDK
 
-`flutter_secure_storage` requires `minSdkVersion 18`. In `android/app/build.gradle`:
+`flutter_secure_storage` 11 requires `minSdk 24` (Android 7.0), which is also
+Flutter's own minimum. If your app pins a lower value, raise it in
+`android/app/build.gradle`:
 
 ```gradle
 android {
     defaultConfig {
-        minSdkVersion 18
+        minSdk 24
     }
 }
 ```
 
-### 3. Initialize once in `main()`
+### 3. Linux — libsecret
+
+On Linux, `flutter_secure_storage` builds against libsecret. Without its
+development package the build fails in CMake with
+`libsecret-1>=0.18.4 not found`:
+
+```bash
+sudo apt install libsecret-1-dev
+```
+
+### 4. Initialize once in `main()`
 
 ```dart
 void main() async {
@@ -144,7 +169,9 @@ BaabaStorage.hive.getKeys('settings');                  // Iterable<dynamic>
 ### Custom objects
 
 ```dart
-// 1. Annotate your model (or write the adapter manually)
+// 1. Annotate your model (or write the adapter manually).
+//    HiveType / HiveField come from `package:hive_ce/hive_ce.dart`;
+//    run `dart run build_runner build` to generate UserProfileAdapter.
 @HiveType(typeId: 0)
 class UserProfile extends HiveObject {
   @HiveField(0) late String name;
@@ -234,9 +261,9 @@ and write pays for it.
 >
 > Hive folds the encryption key into every frame's checksum, so a file written
 > in the clear fails to decode under a cipher. Adding `encryptionCipher:` to a
-> box that already holds data does not migrate it — the open throws, and if you
-> pass `crashRecovery: true` it silently truncates the file instead. Adopting
-> encryption on live data means migrating it yourself:
+> box that already holds data does not migrate it — the open throws a
+> `HiveError` (the file is left untouched). Adopting encryption on live data
+> means migrating it yourself:
 >
 > ```dart
 > // 1. Read the cleartext box.
@@ -285,9 +312,9 @@ that is not what was asked for — Hive itself ignores `encryptionCipher` on an
 already-open box, which is what makes that guard necessary. Across sessions
 nothing can enforce it, because a `.hive` file does not record whether it is
 encrypted: opening an encrypted box with no cipher looks like a corrupt file to
-Hive, and under its `crashRecovery` default the file is truncated and the data is
-gone, with no error raised. Resolve the cipher once at startup and use it for
-every open of that box.
+Hive, and the open fails with a `HiveError`. (hive_ce leaves the file intact;
+the original `hive` package truncated it.) Resolve the cipher once at startup
+and use it for every open of that box.
 
 **When the key is missing.** Use `boxExistsOnDisk` to tell a first run apart from
 a box whose key is gone — a restored device, a wiped Keystore — because those
@@ -300,7 +327,7 @@ final hasKey = await BaabaStorage.secure.containsKey(BaabaStorage.hiveKeyAlias);
 if (onDisk && !hasKey) {
   // Encrypted data that can no longer be read. Tell the user and re-fetch, or
   // delete the box deliberately with deleteBox. Do NOT generate a new key and
-  // open it anyway — that destroys the file.
+  // open it anyway — the open fails, and only the old key can read the file.
 }
 ```
 
@@ -308,7 +335,6 @@ if (onDisk && !hasKey) {
 `StorageException` instead, because generating a replacement would make every
 box encrypted with the original permanently unrecoverable.
 
-### Reactive UI with ValueListenableBuilder
 ### Reactive UI with ValueListenableBuilder
 
 ```dart
@@ -383,8 +409,7 @@ final all    = await BaabaStorage.secure.readAll();  // Map<String, String>
 // Call configure() BEFORE BaabaStorage.init() if you need custom options
 SecureStorage.configure(
   androidOptions: const AndroidOptions(
-    encryptedSharedPreferences: true,
-    resetOnError: true,
+    resetOnError: false,
   ),
   iosOptions: const IOSOptions(
     accessibility: KeychainAccessibility.first_unlock,
@@ -392,6 +417,20 @@ SecureStorage.configure(
 );
 await BaabaStorage.init();
 ```
+
+The options are `flutter_secure_storage`'s own. `encryptedSharedPreferences` and
+`sharedPreferencesName` were removed in its v11 — use `storageNamespace` to
+isolate an instance.
+
+These option types are re-exported, so the example needs only
+`import 'package:baaba_storage_utils/baaba_storage_utils.dart';`.
+
+> ⚠️ **`resetOnError` defaults to `true` on Android.** In the plugin's own
+> words, when an error is detected it resets all data, which will "PERMANENTLY
+> erase the data". That includes the key `hiveCipher()` keeps, leaving every
+> encrypted Hive box unreadable for good. Apps with encrypted boxes should
+> consider `resetOnError: false`, as the example above does, and handle the
+> error that secure-storage calls then throw (sign the user out, re-fetch).
 
 ---
 
@@ -423,7 +462,7 @@ await BaabaStorage.dispose();
 | `BoxTypeMismatchException` | A box name is already open in another flavour (lazy vs regular, or a different value type) |
 | `BoxEncryptionMismatchException` | A box name is already open with a different encryption intent than the one requested — including a box opened outside `BaabaStorage`, whose cipher cannot be verified |
 | `UnsupportedTypeException` | `prefs.set<T>` called with an unsupported type |
-| `HiveError` | Passed through from Hive when an encrypted box cannot be decoded with the cipher given — a wrong key, or a cleartext file. Note hive 2.2.3 also logs this error a second time as an unhandled async error |
+| `HiveError` | Passed through from Hive when a box cannot be decoded with the cipher given — a wrong key, no key for an encrypted box, or a key for a cleartext file. The file is left untouched |
 
 ```dart
 try {
@@ -432,3 +471,30 @@ try {
   // use BaabaStorage.hive instead
 }
 ```
+
+---
+
+## Upgrading from 1.x
+
+2.0.0 swaps the unmaintained `hive` for `hive_ce` and moves to
+`flutter_secure_storage` 11. This package's API is unchanged and existing data
+stays readable: `hive_ce` uses the same file format, and secrets written through
+1.x are already in the format v11 reads. What an app has to change:
+
+1. **SDK:** Dart 3.8+, Flutter 3.44+, Android `minSdk` 24.
+2. **Imports:** `package:hive/hive.dart` → `package:hive_ce/hive_ce.dart`,
+   `package:hive_flutter/hive_flutter.dart` →
+   `package:hive_ce_flutter/hive_ce_flutter.dart`.
+3. **Generator:** replace `hive_generator` with `hive_ce_generator` and
+   regenerate adapters (`dart run build_runner build`).
+4. **Remove every original Hive package.** `flutter pub deps | grep hive` should
+   list only `hive_ce` and `hive_ce_flutter`. Two Hive copies in one app keep
+   separate adapter registries and can open the same box file twice.
+5. **Secure storage options:** drop `encryptedSharedPreferences:` and
+   `sharedPreferencesName:` from any `AndroidOptions`.
+6. **Only if the app used `flutter_secure_storage` older than v10 directly:**
+   v11 cannot read the pre-v10 formats, so users who skip straight to a v11
+   build lose those secrets. Ship a v10 build first, or detect the loss with
+   `FlutterSecureStorage().checkUpgradeStatus()`.
+
+See [CHANGELOG.md](CHANGELOG.md) for the full list.

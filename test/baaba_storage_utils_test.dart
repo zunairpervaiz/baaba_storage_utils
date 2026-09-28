@@ -1,10 +1,9 @@
-import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:hive_flutter/hive_flutter.dart';
+import 'package:hive_ce_flutter/hive_ce_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:baaba_storage_utils/baaba_storage_utils.dart';
@@ -600,27 +599,29 @@ void main() {
     });
 
     test(
-        'crashRecovery: true silently empties a mismatched box — the loss the '
-        'default guards against', () async {
+        'crashRecovery: true still refuses a mismatched box rather than '
+        'emptying it', () async {
       await hive.openBox('enc_recovery');
       await hive.put('enc_recovery', 'nid', '35202-1234567-1');
       await hive.closeBox('enc_recovery');
 
-      // Hive's own default. The checksum fails, Hive reads that as corruption,
-      // truncates the file and returns an empty box — no exception. (It prints
-      // "Recovering corrupted box." while doing so; that line in the test log
-      // is expected here and nowhere else.)
-      final box = await hive.openBox(
-        'enc_recovery',
-        encryptionCipher: HiveAesCipher(keyA),
-        crashRecovery: true,
+      // Original Hive read the failed checksum as corruption and, under crash
+      // recovery, truncated the file to an empty box without throwing. hive_ce
+      // (2.20.1+) recognises a complete but unreadable first frame as a likely
+      // wrong cipher and throws before touching the file — crash recovery only
+      // ever trims an incomplete frame at the end.
+      expect(
+        await _errorFromOpen(() => hive.openBox(
+              'enc_recovery',
+              encryptionCipher: HiveAesCipher(keyA),
+              crashRecovery: true,
+            )),
+        isA<HiveError>(),
       );
-      expect(box.isEmpty, isTrue);
-      await hive.closeBox('enc_recovery');
 
-      // And it is gone for good — not merely undecryptable.
+      // Nothing was truncated: the cleartext data is still there.
       await hive.openBox('enc_recovery');
-      expect(hive.isEmpty('enc_recovery'), isTrue);
+      expect(hive.get<String>('enc_recovery', 'nid'), '35202-1234567-1');
       await hive.closeBox('enc_recovery');
     });
 
@@ -698,26 +699,26 @@ void main() {
       await hive.closeBox('enc_reopen');
     });
 
-    test('opening an encrypted box without its cipher destroys it — the hazard '
-        'a consumer must design around', () async {
+    test('opening an encrypted box without its cipher throws and leaves it '
+        'intact', () async {
       await hive.openBox('enc_no_cipher',
           encryptionCipher: HiveAesCipher(keyA));
       await hive.put('enc_no_cipher', 'nid', '35202-1234567-1');
       await hive.closeBox('enc_no_cipher');
 
-      // Hive cannot tell an encrypted file from a corrupt one, and an open with
-      // no cipher keeps Hive's crashRecovery default of true, so the file is
-      // truncated rather than refused. No exception is thrown.
-      final box = await hive.openBox('enc_no_cipher');
-      expect(box.isEmpty, isTrue);
-      await hive.closeBox('enc_no_cipher');
+      // A .hive file does not record whether it is encrypted, so the wrapper's
+      // guard cannot catch this across sessions, and an open with no cipher
+      // keeps Hive's crashRecovery default of true. Original Hive truncated the
+      // file here; hive_ce refuses the open instead.
+      expect(
+        await _errorFromOpen(() => hive.openBox('enc_no_cipher')),
+        isA<HiveError>(),
+      );
 
-      // Gone for good — the right key does not bring it back. This is why every
-      // open of an encrypted box must pass the cipher: the wrapper's guard only
-      // spans a single session, and there is nothing it can check afterwards.
-      final withKey = await hive.openBox('enc_no_cipher',
+      // The right key still reads it.
+      await hive.openBox('enc_no_cipher',
           encryptionCipher: HiveAesCipher(keyA));
-      expect(withKey.isEmpty, isTrue);
+      expect(hive.get<String>('enc_no_cipher', 'nid'), '35202-1234567-1');
       await hive.closeBox('enc_no_cipher');
     });
 
@@ -909,35 +910,21 @@ void main() {
 
 /// Runs [open] and returns the error it threw, or `null` if it succeeded.
 ///
-/// Needed because a failed `Hive.openBox` in hive 2.2.3 reports its error
-/// twice: once to the caller, and once as an unhandled async error. Its
-/// `HiveImpl._openBox` parks a `Completer` in an internal map so that concurrent
-/// opens can join, and on failure completes that completer with the error —
-/// but when nothing joined, no one is listening, so the error is orphaned. The
-/// awaited call throws as expected; the orphan then lands in the enclosing
-/// zone, which in a test means failing it even when the throw is exactly what
-/// is being asserted.
-///
-/// So the open runs inside its own guarded zone that swallows the duplicate.
-/// Worth knowing in an app too: expect a logged unhandled HiveError alongside
-/// the one you catch.
+/// Plain try/catch is enough: hive 2.2.3 also reported a failed open a second
+/// time as an unhandled async error, which needed a guarded zone to swallow,
+/// but hive_ce reports it only to the caller. Any stray error would now fail
+/// the test, which is the point.
 Future<Object?> _errorFromOpen(Future<void> Function() open) async {
-  Object? thrown;
-  await runZonedGuarded(() async {
-    try {
-      await open();
-    } catch (error) {
-      thrown = error;
-    }
-    // Give the orphaned error a turn of the event loop to surface inside this
-    // zone rather than after it has been torn down.
-    await Future<void>.delayed(Duration.zero);
-  }, (_, __) {});
-  return thrown;
+  try {
+    await open();
+  } catch (error) {
+    return error;
+  }
+  return null;
 }
 
 /// A minimal custom type, hand-written rather than generated, so the typed-box
-/// tests do not pull in hive_generator/build_runner.
+/// tests do not pull in hive_ce_generator/build_runner.
 class _Point {
   const _Point(this.x, this.y);
 

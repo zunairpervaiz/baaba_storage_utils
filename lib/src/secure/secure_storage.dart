@@ -4,7 +4,7 @@
 // A singleton wrapper around the flutter_secure_storage package.
 //
 // flutter_secure_storage uses the OS-level secure enclave to encrypt data:
-//   - Android : Android Keystore + EncryptedSharedPreferences
+//   - Android : AES-GCM, with the key wrapped by the Android Keystore
 //   - iOS/macOS: Keychain
 //   - Windows  : DPAPI (Data Protection API)
 //   - Linux    : libsecret
@@ -42,16 +42,13 @@ const _defaultHeaderPrefix = 'baaba_header_';
 class SecureStorage {
   /// Private constructor — injects the underlying [FlutterSecureStorage].
   ///
-  /// If no [storage] is provided, a sensible default is used:
-  /// - Android: EncryptedSharedPreferences (stronger than the default AES keystore mode)
-  /// - All other platforms: their respective OS defaults
+  /// If no [storage] is provided, every platform uses its OS default. On
+  /// Android that is AES-GCM with a Keystore-wrapped key — the format
+  /// flutter_secure_storage v10 already migrated EncryptedSharedPreferences
+  /// data into, so secrets written by earlier versions of this package are
+  /// still readable.
   SecureStorage._({FlutterSecureStorage? storage})
-      : _storage = storage ??
-            const FlutterSecureStorage(
-              // encryptedSharedPreferences uses Android's EncryptedSharedPreferences
-              // API, which is more secure than the default RSA/AES approach.
-              aOptions: AndroidOptions(encryptedSharedPreferences: true),
-            );
+      : _storage = storage ?? const FlutterSecureStorage();
 
   /// The actual flutter_secure_storage instance that does the real work.
   final FlutterSecureStorage _storage;
@@ -68,13 +65,14 @@ class SecureStorage {
   /// Overrides the default platform options before storage is first used.
   ///
   /// Call this BEFORE [BaabaStorage.init] if you need custom behaviour, e.g.
-  /// different keychain accessibility on iOS or a custom Android keystore alias.
+  /// different keychain accessibility on iOS or an isolated Android
+  /// `storageNamespace`.
   ///
   /// All parameters are optional — omit any platform you don't need to customise.
   ///
   /// Example:
   ///   SecureStorage.configure(
-  ///     androidOptions: const AndroidOptions(encryptedSharedPreferences: true),
+  ///     androidOptions: const AndroidOptions(resetOnError: true),
   ///     iosOptions: const IOSOptions(accessibility: KeychainAccessibility.first_unlock),
   ///   );
   ///   await BaabaStorage.init();
@@ -90,8 +88,7 @@ class SecureStorage {
     _instance = SecureStorage._(
       storage: FlutterSecureStorage(
         // Fall back to sensible defaults for any platform not explicitly configured.
-        aOptions: androidOptions ??
-            const AndroidOptions(encryptedSharedPreferences: true),
+        aOptions: androidOptions ?? const AndroidOptions(),
         iOptions: iosOptions ?? const IOSOptions(),
         lOptions: linuxOptions ?? const LinuxOptions(),
         wOptions: windowsOptions ?? const WindowsOptions(),
