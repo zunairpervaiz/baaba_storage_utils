@@ -1,3 +1,84 @@
+## 3.0.0
+
+### Changed — Hive moved to `baaba_storage_hive`
+
+Hive is no longer part of this package. It lives in a new sibling package,
+`baaba_storage_hive`, in the same repository, which depends on this one (its
+encryption key is kept in `BaabaStorage.secure`) and re-exports it.
+
+An app that needs only prefs and secure storage no longer pulls in `hive_ce`
+or `hive_ce_flutter`. Its startup no longer resolves a Hive directory through
+`path_provider` or creates one on disk, and it no longer inherits
+`hive_ce_flutter`'s Flutter 3.44 floor. (`path_provider` itself stays in the
+dependency tree: `flutter_secure_storage` uses it on Linux and Windows.)
+
+Stored data is unaffected: same SharedPreferences keys, same secure-storage
+entries, same Hive files, and the Hive key stays under `baaba_hive_key`.
+
+**Breaking for consumers:**
+
+- Apps on `baaba_storage_utils: ^2.0.0` are not upgraded automatically; the
+  changes below apply once the constraint becomes `^3.0.0`. (Apps that depend
+  on the git repository instead of pub.dev need
+  `path: packages/baaba_storage_utils`: the package moved into `packages/`.)
+- Removed `BaabaStorage.hive`, `BaabaStorage.hiveCipher()`,
+  `BaabaStorage.hiveKeyAlias` and `BaabaStorage.init`'s `hiveSubDir:`. Apps
+  using Hive switch to `baaba_storage_hive`: `BaabaHive.instance`,
+  `BaabaHive.cipher()`, `BaabaHive.keyAlias`, `BaabaHive.init(subDir:)`. An
+  app that passed `hiveSubDir:` must pass the same value to
+  `BaabaHive.init(subDir:)`, or its boxes appear empty.
+- `BaabaStorage.dispose()` no longer closes Hive boxes or clears the cipher
+  cache; `BaabaHive.dispose()` does.
+- `HiveStorage`, the Hive type re-exports (`Box`, `LazyBox`, `TypeAdapter`,
+  `HiveAesCipher`, …) and the Hive exceptions (`BoxNotOpenException`,
+  `BoxIsLazyException`, `BoxTypeMismatchException`,
+  `BoxEncryptionMismatchException`) moved to `baaba_storage_hive`. They still
+  extend `StorageException`.
+- Minimum SDK is now Dart 3.11 and Flutter 3.41, required by
+  `shared_preferences` 2.5.6, which is now the minimum version (was 2.5.5).
+  Without Hive, the Flutter floor is lower than 2.0.0's 3.44, but the Dart
+  floor is higher than its 3.8. (2.0.0 declared Dart 3.8, but its
+  `shared_preferences` ^2.5.5 already needed 3.9.) Android `minSdk` stays 24.
+- `UnsupportedTypeException`'s message now points at `baaba_storage_hive`
+  instead of `HiveStorage`.
+
+### Fixed
+
+- **`SecureStorage.configure()` called before `BaabaStorage.init()` was
+  silently undone.** `init()` always reconfigured secure storage, with the
+  defaults when it was given no options. So the documented pattern
+  (`configure(...)` then `init()`) never applied any of its options: not
+  `resetOnError: false`, not a `storageNamespace`. `init()` now reconfigures
+  only when it is passed options, and otherwise keeps what `configure()` set.
+
+  **Breaking for consumers who used that pattern:** your options now take
+  effect. Options that decide *where* secrets live change which entries are
+  read. On Android those are `storageNamespace`, `preferencesKeyPrefix` and the
+  cipher algorithms. On iOS/macOS they are `accountName`, `groupId`,
+  `synchronizable` and `accessibility`. Until now your app has been reading and
+  writing with the defaults, so after upgrading it would no longer find
+  existing tokens or the Hive encryption key, and every encrypted box would
+  become unreadable. Before upgrading, either remove those options to stay on
+  the defaults, or migrate: read every secret with default options and write
+  it with the new ones. Options that only change behaviour, such as
+  `resetOnError`, need no action.
+- `PrefsStorage.get<List<String>>` returned `defaultValue` (usually `null`) for
+  any string list loaded from disk, so a list read back correctly only in the
+  session that wrote it. SharedPreferences hands lists loaded from the
+  platform over as `List<Object?>`. `get`, `getAll` and `listenable` now return
+  string lists as `List<String>`.
+
+### Added
+
+- `StorageNotInitializedException.withMessage`, so a package building on this
+  one can throw the same exception type while naming its own missing `init`
+  call. `baaba_storage_hive` uses it for `BaabaHive.init()`.
+
+### Documentation
+
+- README covers prefs and secure storage only, with an "Upgrading from 2.x"
+  section and pointers to `baaba_storage_hive`.
+
 ## 2.0.0
 
 ### Changed — Hive is now `hive_ce`

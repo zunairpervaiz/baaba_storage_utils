@@ -37,27 +37,31 @@ import 'dart:convert';
 
 import 'package:hive_ce/hive_ce.dart';
 
-import '../exceptions/storage_exception.dart';
-import '../secure/secure_storage.dart';
+import 'package:baaba_storage_utils/baaba_storage_utils.dart';
 
 /// Secure-storage key under which the Hive encryption key is stored by default.
 ///
-/// Exposed publicly as [BaabaStorage.hiveKeyAlias] so a consumer can check for
-/// the key's presence without hardcoding the string.
+/// Exposed publicly as [BaabaHive.keyAlias] so a consumer can check for the
+/// key's presence without hardcoding the string.
+///
+/// The value must never change: it is where every install that has ever run an
+/// encrypted box keeps its key, back to 1.3.0 when this was
+/// `BaabaStorage.hiveKeyAlias`. A new alias would find no key, generate a fresh
+/// one, and leave every existing encrypted box unreadable.
 const String defaultHiveKeyAlias = 'baaba_hive_key';
 
-/// Internal machinery behind [BaabaStorage.hiveCipher].
+/// Internal machinery behind [BaabaHive.cipher].
 ///
-/// Not exported: the public entry point is on [BaabaStorage], which spans both
-/// the hive and secure halves of this package and can enforce the
-/// initialisation guard.
+/// Not exported: the public entry point is on [BaabaHive], which enforces the
+/// guard that matters here — that [BaabaStorage.init] has configured secure
+/// storage before a key is read from or written to it.
 class HiveKeyStore {
   HiveKeyStore._();
 
   /// One resolved cipher per alias, memoised for the life of the isolate.
   ///
   /// Two reasons this cache is not just a micro-optimisation. It keeps a
-  /// concurrent pair of `openBox(…, encryptionCipher: await hiveCipher())`
+  /// concurrent pair of `openBox(…, encryptionCipher: await BaabaHive.cipher())`
   /// calls — the shape of a normal app start — from racing each other into
   /// generating two keys and writing the second over the first, which would
   /// leave the box opened by the loser undecryptable. And every read otherwise
@@ -80,20 +84,24 @@ class HiveKeyStore {
     } catch (_) {
       // A failure must not be cached — a Keystore read can fail transiently
       // (device locked, for instance) and the next attempt deserves a real try.
-      _ciphers.remove(alias);
+      // Only evict our own entry: if clearCache ran meanwhile and a newer
+      // resolve is in flight, removing that one would let a further caller
+      // start a second key generation alongside it — and whichever write
+      // lands last orphans every box opened with the other key.
+      if (identical(_ciphers[alias], pending)) _ciphers.remove(alias);
       rethrow;
     }
   }
 
-  /// Forgets every memoised cipher. Called from [BaabaStorage.dispose] so a
+  /// Forgets every memoised cipher. Called from [BaabaHive.dispose] so a
   /// re-initialised app does not keep a cipher from the previous lifetime.
   static void clearCache() => _ciphers.clear();
 
   /// Reads the stored key, or generates and stores one if there is none.
   static Future<HiveCipher> _read(String alias) async {
-    // Deliberately SecureStorage.instance rather than BaabaStorage.secure: this
-    // file must not import the facade that imports it. The caller is
-    // responsible for the initialisation guard.
+    // SecureStorage.instance rather than BaabaStorage.secure, so that the guard
+    // is the caller's alone: BaabaHive.cipher checks BaabaStorage.isInitialized
+    // itself, and tests can drive this class without standing up the facade.
     final stored = await SecureStorage.instance.read(alias);
 
     if (stored != null) return HiveAesCipher(_decode(stored, alias));

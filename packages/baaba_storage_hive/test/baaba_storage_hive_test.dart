@@ -4,151 +4,31 @@ import 'dart:io';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hive_ce_flutter/hive_ce_flutter.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
-import 'package:baaba_storage_utils/baaba_storage_utils.dart';
+import 'package:baaba_storage_hive/baaba_storage_hive.dart';
 // Reaching into src is deliberate: the key-store logic is package-internal, and
-// testing it directly avoids having to stand up a fake path_provider just to
-// satisfy the BaabaStorage.init() guard on the public entry point. The guard
-// itself is tested through the public API below.
-import 'package:baaba_storage_utils/src/hive/hive_cipher.dart';
+// testing it directly keeps these tests independent of the BaabaStorage.init()
+// guard on the public entry point. The guard itself is tested through the
+// public API below.
+import 'package:baaba_storage_hive/src/hive_cipher.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
-  // ── PrefsStorage ────────────────────────────────────────────────────────
-  group('PrefsStorage', () {
-    setUp(() async {
-      SharedPreferences.setMockInitialValues({});
-      await PrefsStorage.init();
+  // ── BaabaHive facade ─────────────────────────────────────────────────────
+  group('BaabaHive', () {
+    test('instance throws until init() has run, naming BaabaHive.init', () {
+      expect(BaabaHive.isInitialized, isFalse);
+      try {
+        BaabaHive.instance;
+        fail('expected StorageNotInitializedException');
+      } on StorageNotInitializedException catch (e) {
+        expect(e.toString(), contains('BaabaHive.init()'));
+      }
     });
 
-    test('set and get String', () async {
-      await PrefsStorage.instance.setString('name', 'Zunair');
-      expect(PrefsStorage.instance.getString('name'), 'Zunair');
-    });
-
-    test('set and get int', () async {
-      await PrefsStorage.instance.setInt('age', 25);
-      expect(PrefsStorage.instance.getInt('age'), 25);
-    });
-
-    test('set and get double', () async {
-      await PrefsStorage.instance.setDouble('score', 9.5);
-      expect(PrefsStorage.instance.getDouble('score'), 9.5);
-    });
-
-    test('set and get bool', () async {
-      await PrefsStorage.instance.setBool('loggedIn', true);
-      expect(PrefsStorage.instance.getBool('loggedIn'), true);
-    });
-
-    test('set and get List<String>', () async {
-      await PrefsStorage.instance.setStringList('tags', ['flutter', 'dart']);
-      expect(
-        PrefsStorage.instance.getStringList('tags'),
-        ['flutter', 'dart'],
-      );
-    });
-
-    test('generic set<T> and get<T>', () async {
-      await PrefsStorage.instance.set<String>('city', 'Lahore');
-      expect(PrefsStorage.instance.get<String>('city'), 'Lahore');
-    });
-
-    test('returns defaultValue for missing key', () {
-      expect(
-        PrefsStorage.instance.getString('missing', defaultValue: 'N/A'),
-        'N/A',
-      );
-      expect(PrefsStorage.instance.getInt('missing', defaultValue: 0), 0);
-      expect(
-        PrefsStorage.instance.getBool('missing', defaultValue: false),
-        false,
-      );
-    });
-
-    test('containsKey', () async {
-      await PrefsStorage.instance.setString('x', '1');
-      expect(PrefsStorage.instance.containsKey('x'), true);
-      expect(PrefsStorage.instance.containsKey('y'), false);
-    });
-
-    test('remove key', () async {
-      await PrefsStorage.instance.setString('temp', 'value');
-      await PrefsStorage.instance.remove('temp');
-      expect(PrefsStorage.instance.containsKey('temp'), false);
-    });
-
-    test('clear all keys', () async {
-      await PrefsStorage.instance.setString('a', '1');
-      await PrefsStorage.instance.setString('b', '2');
-      await PrefsStorage.instance.clear();
-      expect(PrefsStorage.instance.getKeys(), isEmpty);
-    });
-
-    test('getAll returns map of all stored values', () async {
-      SharedPreferences.setMockInitialValues({});
-      await PrefsStorage.init();
-      await PrefsStorage.instance.setString('k1', 'v1');
-      await PrefsStorage.instance.setInt('k2', 42);
-      final all = PrefsStorage.instance.getAll();
-      expect(all['k1'], 'v1');
-      expect(all['k2'], 42);
-    });
-
-    test('throws UnsupportedTypeException for Map', () {
-      expect(
-        () => PrefsStorage.instance.set<Map>('map', {}),
-        throwsA(isA<UnsupportedTypeException>()),
-      );
-    });
-
-    // ── Reactive ────────────────────────────────────────────────────────────
-
-    test('watch<String> emits new value on setString', () async {
-      final future = PrefsStorage.instance.watch<String>('reactKey').first;
-      await PrefsStorage.instance.setString('reactKey', 'hello');
-      expect(await future, 'hello');
-    });
-
-    test('watch<bool> emits new value on set<T>', () async {
-      final future = PrefsStorage.instance.watch<bool>('flag').first;
-      await PrefsStorage.instance.set<bool>('flag', true);
-      expect(await future, true);
-    });
-
-    test('watch emits null when key is removed', () async {
-      await PrefsStorage.instance.setString('toRemove', 'bye');
-      final future = PrefsStorage.instance.watch<String>('toRemove').first;
-      await PrefsStorage.instance.remove('toRemove');
-      expect(await future, null);
-    });
-
-    test('watch emits null for all keys on clear', () async {
-      await PrefsStorage.instance.setString('c1', 'v1');
-      await PrefsStorage.instance.setString('c2', 'v2');
-      final f1 = PrefsStorage.instance.watch<String>('c1').first;
-      final f2 = PrefsStorage.instance.watch<String>('c2').first;
-      await PrefsStorage.instance.clear();
-      expect(await f1, null);
-      expect(await f2, null);
-    });
-
-    test('listenable updates value on write', () async {
-      await PrefsStorage.instance.setInt('score', 0);
-      final notifier = PrefsStorage.instance.listenable('score');
-      expect(notifier.value, 0);
-      await PrefsStorage.instance.setInt('score', 42);
-      expect(notifier.value, 42);
-    });
-
-    test('changes stream fires MapEntry for every write', () async {
-      final future = PrefsStorage.instance.changes.first;
-      await PrefsStorage.instance.setString('evt', 'fired');
-      final entry = await future;
-      expect(entry.key, 'evt');
-      expect(entry.value, 'fired');
+    test('keyAlias is unchanged from 2.x, so existing keys are found', () {
+      expect(BaabaHive.keyAlias, 'baaba_hive_key');
     });
   });
 
@@ -502,7 +382,7 @@ void main() {
 
     // Fixed keys rather than Hive.generateSecureKey(), so that "reopen with the
     // same key" and "reopen with a different key" are both expressible. Real
-    // apps get theirs from BaabaStorage.hiveCipher(); a test wants determinism.
+    // apps get theirs from BaabaHive.cipher(); a test wants determinism.
     final keyA = List<int>.filled(32, 1);
     final keyB = List<int>.filled(32, 2);
 
@@ -754,18 +634,103 @@ void main() {
     });
   });
 
+  // ── HiveStorage: concurrent opens ────────────────────────────────────────
+  //
+  // Hive makes a second open of a name that is still being opened wait for the
+  // first and return the same box, ignoring the second call's parameters. The
+  // wrapper must treat such calls as if they had been sequential.
+  group('HiveStorage — concurrent opens', () {
+    late Directory tempDir;
+    final hive = HiveStorage.instance;
+    final key = List<int>.filled(32, 1);
+
+    setUpAll(() async {
+      tempDir = await Directory.systemTemp.createTemp('hive_race_test_');
+      HiveStorage.initForTest(tempDir.path);
+    });
+
+    tearDownAll(() async {
+      await Hive.close();
+      await tempDir.delete(recursive: true);
+    });
+
+    test('matching concurrent opens share one box', () async {
+      final boxes = await Future.wait([
+        hive.openBox('race_same', encryptionCipher: HiveAesCipher(key)),
+        hive.openBox('race_same', encryptionCipher: HiveAesCipher(key)),
+      ]);
+      expect(identical(boxes[0], boxes[1]), isTrue);
+      await hive.closeBox('race_same');
+    });
+
+    test('a concurrent request for encryption does not get a plaintext box',
+        () async {
+      final plain = hive.openBox('race_plain_first');
+      final encrypted =
+          hive.openBox('race_plain_first', encryptionCipher: HiveAesCipher(key));
+      await plain;
+      await expectLater(
+        encrypted,
+        throwsA(isA<BoxEncryptionMismatchException>()),
+      );
+      await hive.closeBox('race_plain_first');
+    });
+
+    test('a concurrent plaintext request does not get an encrypted box',
+        () async {
+      final encrypted =
+          hive.openBox('race_enc_first', encryptionCipher: HiveAesCipher(key));
+      final plain = hive.openBox('race_enc_first');
+      await encrypted;
+      await expectLater(plain, throwsA(isA<BoxEncryptionMismatchException>()));
+      await hive.closeBox('race_enc_first');
+    });
+
+    test('concurrent opens in different flavours throw our exception',
+        () async {
+      final regular = hive.openBox('race_flavour');
+      final lazy = hive.openLazyBox('race_flavour');
+      final typed = hive.openTypedBox<int>('race_flavour');
+      await regular;
+      await expectLater(lazy, throwsA(isA<BoxTypeMismatchException>()));
+      await expectLater(typed, throwsA(isA<BoxTypeMismatchException>()));
+      await hive.closeBox('race_flavour');
+    });
+
+    test('a failed open does not block the next one', () async {
+      await hive.openBox('race_fail', encryptionCipher: HiveAesCipher(key));
+      await hive.put('race_fail', 'k', 'v');
+      await hive.closeBox('race_fail');
+
+      // The first open uses the wrong key and fails; the second, queued behind
+      // it, must still get its own attempt.
+      final wrong = hive.openBox('race_fail',
+          encryptionCipher: HiveAesCipher(List<int>.filled(32, 2)));
+      final right =
+          hive.openBox('race_fail', encryptionCipher: HiveAesCipher(key));
+      expect(await _errorFromOpen(() => wrong), isA<HiveError>());
+      await right;
+      expect(hive.get<String>('race_fail', 'k'), 'v');
+      await hive.closeBox('race_fail');
+    });
+  });
+
   // ── The encryption key ────────────────────────────────────────────────────
-  group('hiveCipher / HiveKeyStore', () {
+  group('BaabaHive.cipher / HiveKeyStore', () {
     setUp(() {
       HiveKeyStore.clearCache();
     });
 
-    test('BaabaStorage.hiveCipher throws until init() has run', () {
+    test('BaabaHive.cipher throws until BaabaStorage.init() has run', () {
+      // BaabaHive.init alone is not enough: the key must be read through the
+      // secure-storage options BaabaStorage.init configures.
       expect(BaabaStorage.isInitialized, isFalse);
-      expect(
-        () => BaabaStorage.hiveCipher(),
-        throwsA(isA<StorageNotInitializedException>()),
-      );
+      try {
+        BaabaHive.cipher();
+        fail('expected StorageNotInitializedException');
+      } on StorageNotInitializedException catch (e) {
+        expect(e.toString(), contains('BaabaStorage.init()'));
+      }
     });
 
     test('generates one key and returns the same cipher afterwards', () async {
@@ -774,18 +739,18 @@ void main() {
       final store = <String, String>{};
       FlutterSecureStorage.setMockInitialValues(store);
 
-      final first = await HiveKeyStore.resolve(BaabaStorage.hiveKeyAlias);
-      final second = await HiveKeyStore.resolve(BaabaStorage.hiveKeyAlias);
+      final first = await HiveKeyStore.resolve(BaabaHive.keyAlias);
+      final second = await HiveKeyStore.resolve(BaabaHive.keyAlias);
       expect(second.calculateKeyCrc(), first.calculateKeyCrc());
 
       // Exactly one 256-bit key, under the documented alias.
-      expect(store.keys, [BaabaStorage.hiveKeyAlias]);
+      expect(store.keys, [BaabaHive.keyAlias]);
       expect(base64Decode(store.values.single).length, 32);
 
       // Not just the in-memory memo: after forgetting it, the key is read back
       // from secure storage rather than regenerated.
       HiveKeyStore.clearCache();
-      final third = await HiveKeyStore.resolve(BaabaStorage.hiveKeyAlias);
+      final third = await HiveKeyStore.resolve(BaabaHive.keyAlias);
       expect(third.calculateKeyCrc(), first.calculateKeyCrc());
       expect(store.length, 1);
     });
@@ -798,9 +763,9 @@ void main() {
       // cipher at once. Without single-flight, the later write wins and every
       // box opened with the earlier key becomes unreadable.
       final ciphers = await Future.wait([
-        HiveKeyStore.resolve(BaabaStorage.hiveKeyAlias),
-        HiveKeyStore.resolve(BaabaStorage.hiveKeyAlias),
-        HiveKeyStore.resolve(BaabaStorage.hiveKeyAlias),
+        HiveKeyStore.resolve(BaabaHive.keyAlias),
+        HiveKeyStore.resolve(BaabaHive.keyAlias),
+        HiveKeyStore.resolve(BaabaHive.keyAlias),
       ]);
 
       expect(ciphers.map((c) => c.calculateKeyCrc()).toSet(), hasLength(1));
@@ -815,62 +780,52 @@ void main() {
     });
 
     test('a stored key that is not base64 throws and is left alone', () async {
-      final store = <String, String>{BaabaStorage.hiveKeyAlias: 'not base64!!'};
+      final store = <String, String>{BaabaHive.keyAlias: 'not base64!!'};
       FlutterSecureStorage.setMockInitialValues(store);
 
       await expectLater(
-        HiveKeyStore.resolve(BaabaStorage.hiveKeyAlias),
+        HiveKeyStore.resolve(BaabaHive.keyAlias),
         throwsA(isA<StorageException>()),
       );
       // Untouched — replacing it would make existing boxes unreadable forever.
-      expect(store[BaabaStorage.hiveKeyAlias], 'not base64!!');
+      expect(store[BaabaHive.keyAlias], 'not base64!!');
     });
 
     test('a stored key of the wrong length throws and is left alone', () async {
       final short = base64Encode(List<int>.filled(16, 7));
-      final store = <String, String>{BaabaStorage.hiveKeyAlias: short};
+      final store = <String, String>{BaabaHive.keyAlias: short};
       FlutterSecureStorage.setMockInitialValues(store);
 
       await expectLater(
-        HiveKeyStore.resolve(BaabaStorage.hiveKeyAlias),
+        HiveKeyStore.resolve(BaabaHive.keyAlias),
         throwsA(isA<StorageException>()),
       );
-      expect(store[BaabaStorage.hiveKeyAlias], short);
+      expect(store[BaabaHive.keyAlias], short);
     });
 
     test('the failure message never contains the key material', () async {
       final secret = base64Encode(List<int>.filled(16, 7));
       FlutterSecureStorage.setMockInitialValues(
-        <String, String>{BaabaStorage.hiveKeyAlias: secret},
+        <String, String>{BaabaHive.keyAlias: secret},
       );
 
       try {
-        await HiveKeyStore.resolve(BaabaStorage.hiveKeyAlias);
+        await HiveKeyStore.resolve(BaabaHive.keyAlias);
         fail('expected a StorageException');
       } on StorageException catch (e) {
         expect(e.toString(), isNot(contains(secret)));
-        expect(e.toString(), contains(BaabaStorage.hiveKeyAlias));
+        expect(e.toString(), contains(BaabaHive.keyAlias));
       }
     });
   });
 
-  // ── StorageException ─────────────────────────────────────────────────────
-  group('StorageException', () {
-    test('StorageNotInitializedException message is descriptive', () {
-      const ex = StorageNotInitializedException();
-      expect(ex.toString(), contains('BaabaStorage is not initialized'));
-    });
-
-    test('BoxNotOpenException includes box name', () {
+  // ── Hive exceptions ──────────────────────────────────────────────────────
+  group('Hive exceptions', () {
+    test('BoxNotOpenException includes box name and the BaabaHive fix', () {
       final ex = BoxNotOpenException('myBox');
       expect(ex.toString(), contains('myBox'));
+      expect(ex.toString(), contains('BaabaHive.instance.openBox'));
     });
-
-    test('UnsupportedTypeException includes type name', () {
-      final ex = UnsupportedTypeException(Map);
-      expect(ex.toString(), contains('Map'));
-    });
-
     test('BoxTypeMismatchException reports both flavours', () {
       final ex = BoxTypeMismatchException(
         'myBox',
@@ -901,7 +856,7 @@ void main() {
         wantedEncrypted: true,
         actualEncrypted: null,
       );
-      expect(ex.toString(), contains('opened outside BaabaStorage'));
+      expect(ex.toString(), contains('opened outside BaabaHive'));
     });
   });
 }

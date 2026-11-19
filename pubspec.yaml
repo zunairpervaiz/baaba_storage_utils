@@ -1,27 +1,14 @@
-name: baaba_storage_utils
-description: "A unified Flutter storage package combining SharedPreferences, Hive, and Flutter Secure Storage with a clean, simple API."
-version: 2.0.0
-homepage:
+# Pub workspace root, never published. It lets the two packages resolve each
+# other locally: baaba_storage_hive depends on baaba_storage_utils ^3.0.0 as
+# published on pub.dev, and inside this workspace that constraint is satisfied
+# by packages/baaba_storage_utils instead. Run `flutter pub get` once, here or
+# in either package; there is one pubspec.lock and .dart_tool, at this root.
+name: baaba_storage_workspace
+publish_to: none
 
 environment:
-  # flutter_secure_storage 11 needs Dart 3.8; hive_ce_flutter needs Flutter 3.44.
-  sdk: ^3.8.0
-  flutter: ">=3.44.0"
+  sdk: ^3.11.0
 
-dependencies:
-  flutter:
-    sdk: flutter
-  shared_preferences: ^2.5.5
-  # Direct dependency because baaba_storage_utils.dart re-exports Hive's types.
-  # hive_ce_flutter re-exports hive_ce too, but the version we hand to
-  # consumers should be one we pin ourselves rather than inherit.
-  hive_ce: ^2.20.1
-  hive_ce_flutter: ^2.4.0
-  flutter_secure_storage: ^11.2.0
-
-dev_dependencies:
-  flutter_test:
-    sdk: flutter
-  flutter_lints: ^5.0.0
-
-flutter:
+workspace:
+  - packages/baaba_storage_utils
+  - packages/baaba_storage_hive

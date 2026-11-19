@@ -1,3 +1,9 @@
+// The whole of baaba_storage_utils, so an app using Hive needs one import —
+// `package:baaba_storage_hive/baaba_storage_hive.dart` — and one dependency.
+// BaabaStorage is not optional for such an app anyway: BaabaHive.cipher keeps
+// its key in BaabaStorage.secure.
+export 'package:baaba_storage_utils/baaba_storage_utils.dart';
+
 // Hive types appear throughout this package's public API — openBox returns a
 // Box, openLazyBox a LazyBox, watch a Stream<BoxEvent>, registerAdapter takes a
 // TypeAdapter. Re-exporting them means a consumer can write those types in its
@@ -21,17 +27,7 @@ export 'package:hive_ce/hive_ce.dart'
         LazyBox,
         TypeAdapter;
 
-// The platform option types for the same reason: BaabaStorage.init and
-// SecureStorage.configure take them, so a consumer customising secure storage
-// should not need flutter_secure_storage in its own pubspec.
-export 'package:flutter_secure_storage/flutter_secure_storage.dart'
-    show
-        AndroidOptions,
-        IOSOptions,
-        KeychainAccessibility,
-        LinuxOptions,
-        MacOsOptions,
-        WebOptions,
-        WindowsOptions;
-
-export 'src/baaba_storage.dart';
+export 'src/baaba_hive.dart';
+export 'src/hive_exceptions.dart';
+// Only the class: the file's shared not-initialised constant is internal.
+export 'src/hive_storage.dart' show HiveStorage;
