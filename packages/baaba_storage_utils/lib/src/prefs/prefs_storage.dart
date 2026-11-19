@@ -11,7 +11,7 @@
 //   - user display preferences
 //
 // It does NOT support complex types like Maps or custom objects.
-// For those, use HiveStorage instead.
+// For those, use Hive boxes from the baaba_storage_hive package instead.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import 'dart:async';
@@ -143,9 +143,10 @@ class PrefsStorage {
     final sp = _sp;
     bool result;
 
-    // Check the runtime type of value and delegate to the correct
-    // SharedPreferences method. Order matters — check bool before int
-    // because bool is a subtype of Object but not int.
+    // Check the runtime type of value and delegate to the matching
+    // SharedPreferences method. On native platforms the types are disjoint.
+    // On the web numbers are JS numbers, so a whole double such as 5.0 also
+    // passes `is int` and is stored with setInt, being checked first.
     if (value is String) {
       result = await sp.setString(key, value);
     } else if (value is int) {
@@ -180,7 +181,7 @@ class PrefsStorage {
     if (!sp.containsKey(key)) return defaultValue;
 
     try {
-      final value = sp.get(key); // returns Object? (the raw stored value)
+      final value = _raw(sp, key);
       if (value == null) return defaultValue;
 
       // `as T?` performs a runtime type cast.
@@ -191,6 +192,25 @@ class PrefsStorage {
       // Return defaultValue instead of crashing.
       return defaultValue;
     }
+  }
+
+  /// The value stored under [key], with a string list as a real
+  /// `List<String>`.
+  ///
+  /// SharedPreferences keeps what it loaded from the platform as-is, and a
+  /// string list arrives from there as a `List<Object?>`; only its own
+  /// getStringList casts. Without this, `get<List<String>>` would work for a
+  /// list written in this session and silently return the default for the
+  /// same list after an app restart. A list is the only collection
+  /// SharedPreferences stores, so every list here is a string list.
+  static Object? _raw(SharedPreferences sp, String key) {
+    final value = sp.get(key);
+    // toList forces the lazy cast, so a non-string element fails here, inside
+    // the caller's TypeError handling, rather than later in the caller's code.
+    if (value is List && value is! List<String>) {
+      return value.cast<String>().toList();
+    }
+    return value;
   }
 
   // ── Typed convenience methods ─────────────────────────────────────────────
@@ -287,10 +307,11 @@ class PrefsStorage {
 
   /// Returns every stored key/value pair as a [Map].
   /// Useful for debugging or bulk operations.
+  ///
+  /// String lists come back as `List<String>`, as [get] returns them.
   Map<String, dynamic> getAll() {
-    final keys = _sp.getKeys();
-    // Build a map by iterating all keys and fetching each value.
-    return {for (final k in keys) k: _sp.get(k)};
+    final sp = _sp;
+    return {for (final k in sp.getKeys()) k: _raw(sp, k)};
   }
 
   /// Forces a reload from disk.

@@ -1,0 +1,25 @@
+name: baaba_storage_utils
+description: "A unified Flutter storage facade over SharedPreferences and Flutter Secure Storage. Add baaba_storage_hive for Hive boxes."
+version: 3.0.0
+homepage:
+resolution: workspace
+
+environment:
+  # shared_preferences 2.5.6 needs Dart 3.11 and Flutter 3.41 (flutter_secure_storage
+  # 11 needs only Dart 3.8). Hive's higher Flutter floor lives in
+  # baaba_storage_hive, so apps that skip Hive do not inherit it.
+  sdk: ^3.11.0
+  flutter: ">=3.41.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  shared_preferences: ^2.5.6
+  flutter_secure_storage: ^11.2.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:

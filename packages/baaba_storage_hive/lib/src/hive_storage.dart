@@ -13,20 +13,34 @@
 // meaning your widgets can automatically rebuild when data changes.
 //
 // Typical usage:
-//   await BaabaStorage.hive.openBox('settings');
-//   await BaabaStorage.hive.put('settings', 'theme', 'dark');
-//   final theme = BaabaStorage.hive.get<String>('settings', 'theme');
+//   await BaabaHive.instance.openBox('settings');
+//   await BaabaHive.instance.put('settings', 'theme', 'dark');
+//   final theme = BaabaHive.instance.get<String>('settings', 'theme');
 // ─────────────────────────────────────────────────────────────────────────────
+
+import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:hive_ce_flutter/hive_ce_flutter.dart';
 
-import '../exceptions/storage_exception.dart';
+import 'package:baaba_storage_utils/baaba_storage_utils.dart';
+
+import 'hive_exceptions.dart';
+
+/// What every Hive entry point throws when used before [BaabaHive.init].
+///
+/// Package-internal (the library exports only [HiveStorage] from this file):
+/// shared so [HiveStorage] and [BaabaHive] give the same message.
+const StorageNotInitializedException hiveNotInitializedException =
+    StorageNotInitializedException.withMessage(
+  'BaabaHive is not initialized. '
+  'Call await BaabaHive.init() in main() before opening Hive boxes.',
+);
 
 /// Wraps [Hive] with a clean singleton API.
 ///
-/// Do not instantiate directly — access via [BaabaStorage.hive]
-/// or [HiveStorage.instance] after calling [BaabaStorage.init].
+/// Do not instantiate directly — access via [BaabaHive.instance]
+/// (or [HiveStorage.instance]) after calling [BaabaHive.init].
 class HiveStorage {
   // Private constructor — prevents instantiation from outside this class.
   HiveStorage._();
@@ -49,7 +63,7 @@ class HiveStorage {
   /// [subDir] is an optional folder name inside documents, e.g. 'hive_data'.
   /// If omitted, Hive files are stored directly in the documents root.
   ///
-  /// Called automatically by [BaabaStorage.init].
+  /// Called by [BaabaHive.init].
   static Future<void> init({String? subDir}) async {
     // initFlutter resolves the correct storage path for each platform
     // (Documents on Android/iOS, AppData on Windows, etc.)
@@ -69,8 +83,12 @@ class HiveStorage {
 
   /// Guards every method — throws [StorageNotInitializedException]
   /// if someone tries to use Hive before calling [init].
+  ///
+  /// The shared exception type, so one handler covers both packages; the
+  /// message names [BaabaHive.init], because [BaabaStorage.init] no longer
+  /// touches Hive and pointing at it would send the caller the wrong way.
   void _ensureInitialized() {
-    if (!_initialized) throw const StorageNotInitializedException();
+    if (!_initialized) throw hiveNotInitializedException;
   }
 
   // ── Box bookkeeping ───────────────────────────────────────────────────────
@@ -159,10 +177,61 @@ class HiveStorage {
   Never _throwUnadoptable(String name) => throw BoxTypeMismatchException(
         name,
         wanted: 'a dynamic box',
-        actual: 'a typed box opened outside BaabaStorage',
-        hint: 'Open it with BaabaStorage.hive.openTypedBox<T>("$name") so '
-            'BaabaStorage can track it, or use the Box<T> that Hive returned.',
+        actual: 'a typed box opened outside BaabaHive',
+        hint: 'Open it with BaabaHive.instance.openTypedBox<T>("$name") so '
+            'BaabaHive can track it, or use the Box<T> that Hive returned.',
       );
+
+  // ── Opens in flight ───────────────────────────────────────────────────────
+  //
+  // Every check an opener makes — flavour, value type, encryption intent — is
+  // against a box that is already open. A box that is still *being* opened
+  // slips past all of them: Hive.isBoxOpen says no, so the second caller goes
+  // on to Hive.openBox itself, and Hive, finding an open of that name already
+  // under way, waits for it and hands back the same box, ignoring the second
+  // caller's cipher. Two concurrent opens at app start — one with a cipher,
+  // one without — would each get a box, and one of them would be told
+  // something false about its encryption.
+  //
+  // So an open in flight is recorded here, and a second opener of the same
+  // name waits for it to finish and then runs its checks against the box it
+  // produced, exactly as if the calls had been sequential.
+
+  /// Completes (never with an error) when the open of the box keyed by
+  /// [_key] finishes, successfully or not.
+  final Map<String, Future<void>> _opening = <String, Future<void>>{};
+
+  /// Waits until no open of [name] is in flight.
+  ///
+  /// Loops because another opener may start between one open finishing and
+  /// this one resuming. Callers must not `await` anything between this
+  /// returning and calling [_openGuarded]: that synchronous stretch is what
+  /// makes check-then-open atomic.
+  Future<void> _awaitOpening(String name) async {
+    for (var pending = _opening[_key(name)];
+        pending != null;
+        pending = _opening[_key(name)]) {
+      await pending;
+    }
+  }
+
+  /// Runs [open] — which must open the box *and* [_remember] it — while
+  /// recording it as in flight for [name].
+  ///
+  /// Remembering inside [open] matters: waiters resume as soon as the record
+  /// is dropped, and must find the box already tracked with its encryption
+  /// intent, not adopt it as "unknown".
+  Future<B> _openGuarded<B>(String name, Future<B> Function() open) async {
+    final key = _key(name);
+    final done = Completer<void>();
+    _opening[key] = done.future;
+    try {
+      return await open();
+    } finally {
+      _opening.remove(key);
+      done.complete();
+    }
+  }
 
   // ── Encryption bookkeeping ────────────────────────────────────────────────
   //
@@ -255,7 +324,7 @@ class HiveStorage {
   /// same typeId — useful during development.
   ///
   /// Example (using hive_ce_generator):
-  ///   BaabaStorage.hive.registerAdapter(UserProfileAdapter());
+  ///   BaabaHive.instance.registerAdapter(UserProfileAdapter());
   void registerAdapter<T>(TypeAdapter<T> adapter, {bool override = false}) {
     _ensureInitialized();
     Hive.registerAdapter<T>(adapter, override: override);
@@ -280,19 +349,19 @@ class HiveStorage {
   /// The box persists on disk across app restarts.
   ///
   /// Example:
-  ///   await BaabaStorage.hive.openBox('settings');
+  ///   await BaabaHive.instance.openBox('settings');
   ///
   /// **Encryption.** Pass [encryptionCipher] to store the box AES-256 encrypted
   /// on disk — the fix for a box holding anything a device thief should not be
   /// able to read (identity documents, biometrics, health data). Keys, tokens
   /// and PII belong behind a cipher; a cache of public reference data does not
-  /// need one. [BaabaStorage.hiveCipher] resolves a per-install key out of
+  /// need one. [BaabaHive.cipher] resolves a per-install key out of
   /// Keystore-backed secure storage:
   ///
   /// ```dart
-  /// await BaabaStorage.hive.openBox(
+  /// await BaabaHive.instance.openBox(
   ///   'citizens',
-  ///   encryptionCipher: await BaabaStorage.hiveCipher(),
+  ///   encryptionCipher: await BaabaHive.cipher(),
   /// );
   /// ```
   ///
@@ -316,6 +385,15 @@ class HiveStorage {
     bool? crashRecovery,
   }) async {
     _ensureInitialized();
+    // Nothing may be awaited between here and _openGuarded — see _awaitOpening.
+    if (_opening[_key(name)] != null) {
+      await _awaitOpening(name);
+      return openBox(
+        name,
+        encryptionCipher: encryptionCipher,
+        crashRecovery: crashRecovery,
+      );
+    }
     // If the box is already open (e.g. called twice), just return it.
     final existing = _lookup(name);
     if (existing != null) {
@@ -331,15 +409,18 @@ class HiveStorage {
       return existing.box as Box<dynamic>;
     }
     if (Hive.isBoxOpen(name)) _throwUnadoptable(name);
-    return _remember(
+    return _openGuarded(
       name,
-      await Hive.openBox<dynamic>(
+      () async => _remember(
         name,
-        encryptionCipher: encryptionCipher,
-        crashRecovery: _resolveCrashRecovery(crashRecovery, encryptionCipher),
+        await Hive.openBox<dynamic>(
+          name,
+          encryptionCipher: encryptionCipher,
+          crashRecovery: _resolveCrashRecovery(crashRecovery, encryptionCipher),
+        ),
+        dynamic,
+        encryptionCipher != null,
       ),
-      dynamic,
-      encryptionCipher != null,
     );
   }
 
@@ -350,8 +431,8 @@ class HiveStorage {
   /// was first opened — mixing types on the same box name will throw.
   ///
   /// Example:
-  ///   BaabaStorage.hive.registerAdapter(UserProfileAdapter());
-  ///   await BaabaStorage.hive.openTypedBox`<UserProfile>`('profiles');
+  ///   BaabaHive.instance.registerAdapter(UserProfileAdapter());
+  ///   await BaabaHive.instance.openTypedBox`<UserProfile>`('profiles');
   ///
   /// Pass [encryptionCipher] to encrypt the box at rest — the same rules and
   /// the same migration caveat as [openBox], which documents both. A box of
@@ -363,6 +444,15 @@ class HiveStorage {
   }) async {
     _ensureInitialized();
     final key = _key(name);
+    // Nothing may be awaited between here and _openGuarded — see _awaitOpening.
+    if (_opening[key] != null) {
+      await _awaitOpening(name);
+      return openTypedBox<E>(
+        name,
+        encryptionCipher: encryptionCipher,
+        crashRecovery: crashRecovery,
+      );
+    }
 
     final tracked = _openedBoxes[key];
     if (tracked != null && tracked.box.isOpen) {
@@ -398,15 +488,18 @@ class HiveStorage {
       _checkEncryption(name, null, encryptionCipher);
       return adopted;
     }
-    return _remember(
+    return _openGuarded(
       key,
-      await Hive.openBox<E>(
-        name,
-        encryptionCipher: encryptionCipher,
-        crashRecovery: _resolveCrashRecovery(crashRecovery, encryptionCipher),
+      () async => _remember(
+        key,
+        await Hive.openBox<E>(
+          name,
+          encryptionCipher: encryptionCipher,
+          crashRecovery: _resolveCrashRecovery(crashRecovery, encryptionCipher),
+        ),
+        E,
+        encryptionCipher != null,
       ),
-      E,
-      encryptionCipher != null,
     );
   }
 
@@ -431,6 +524,15 @@ class HiveStorage {
     bool? crashRecovery,
   }) async {
     _ensureInitialized();
+    // Nothing may be awaited between here and _openGuarded — see _awaitOpening.
+    if (_opening[_key(name)] != null) {
+      await _awaitOpening(name);
+      return openLazyBox(
+        name,
+        encryptionCipher: encryptionCipher,
+        crashRecovery: crashRecovery,
+      );
+    }
     final existing = _lookup(name);
     if (existing != null) {
       final box = existing.box;
@@ -446,15 +548,18 @@ class HiveStorage {
       return box;
     }
     if (Hive.isBoxOpen(name)) _throwUnadoptable(name);
-    return _remember(
+    return _openGuarded(
       name,
-      await Hive.openLazyBox<dynamic>(
+      () async => _remember(
         name,
-        encryptionCipher: encryptionCipher,
-        crashRecovery: _resolveCrashRecovery(crashRecovery, encryptionCipher),
+        await Hive.openLazyBox<dynamic>(
+          name,
+          encryptionCipher: encryptionCipher,
+          crashRecovery: _resolveCrashRecovery(crashRecovery, encryptionCipher),
+        ),
+        dynamic,
+        encryptionCipher != null,
       ),
-      dynamic,
-      encryptionCipher != null,
     );
   }
 
@@ -478,8 +583,8 @@ class HiveStorage {
   /// only thing that can ever read the file.
   ///
   /// ```dart
-  /// final onDisk = await BaabaStorage.hive.boxExistsOnDisk('citizens');
-  /// final hasKey = await BaabaStorage.secure.containsKey('baaba_hive_key');
+  /// final onDisk = await BaabaHive.instance.boxExistsOnDisk('citizens');
+  /// final hasKey = await BaabaStorage.secure.containsKey(BaabaHive.keyAlias);
   /// if (onDisk && !hasKey) {
   ///   // Encrypted data we can no longer read. Do not open it.
   /// }
@@ -542,7 +647,7 @@ class HiveStorage {
   /// The box must be open before calling this — see [openBox].
   ///
   /// Example:
-  ///   await BaabaStorage.hive.put('settings', 'fontSize', 16.0);
+  ///   await BaabaHive.instance.put('settings', 'fontSize', 16.0);
   Future<void> put<E>(String boxName, dynamic key, E value) =>
       _boxBase(boxName).put(key, value);
 
@@ -555,7 +660,7 @@ class HiveStorage {
   /// never satisfies a `Box<UserProfile>` even when every value is one.
   ///
   /// Example:
-  ///   await BaabaStorage.hive.putAll('config', {'a': 1, 'b': 2, 'c': 3});
+  ///   await BaabaHive.instance.putAll('config', {'a': 1, 'b': 2, 'c': 3});
   Future<void> putAll<E>(String boxName, Map<dynamic, E> entries) =>
       _boxBase(boxName).putAll(entries);
 
@@ -568,7 +673,7 @@ class HiveStorage {
   /// Not available on a lazy box — throws [BoxIsLazyException]. Use [getLazy].
   ///
   /// Example:
-  ///   final theme = BaabaStorage.hive.get`<String>`('settings', 'theme', defaultValue: 'light');
+  ///   final theme = BaabaHive.instance.get`<String>`('settings', 'theme', defaultValue: 'light');
   E? get<E>(String boxName, dynamic key, {E? defaultValue}) {
     // Retrieve raw value (untyped) from the box.
     final raw = _box(boxName, 'get()').get(key);
@@ -584,8 +689,8 @@ class HiveStorage {
   /// missing key or a type mismatch, exactly like [get].
   ///
   /// Example:
-  ///   await BaabaStorage.hive.openLazyBox('blobs');
-  ///   final blob = await BaabaStorage.hive.getLazy`<String>`('blobs', 'report');
+  ///   await BaabaHive.instance.openLazyBox('blobs');
+  ///   final blob = await BaabaHive.instance.getLazy`<String>`('blobs', 'report');
   Future<E?> getLazy<E>(String boxName, dynamic key, {E? defaultValue}) async {
     final box = _boxBase(boxName);
     final raw =
@@ -625,7 +730,7 @@ class HiveStorage {
   /// Not available on a lazy box — throws [BoxIsLazyException]. Use [getAllLazy].
   ///
   /// Example:
-  ///   final allScores = BaabaStorage.hive.getAll`<int>`('scores');
+  ///   final allScores = BaabaHive.instance.getAll`<int>`('scores');
   Iterable<E> getAll<E>(String boxName) =>
       _box(boxName, 'getAll()').values.cast<E>();
 
@@ -637,7 +742,7 @@ class HiveStorage {
   /// mismatch is visible, and skipping keeps one bad row from killing the scan.
   ///
   /// Example:
-  ///   final pending = await BaabaStorage.hive.getAllLazy`<String>`('queue');
+  ///   final pending = await BaabaHive.instance.getAllLazy`<String>`('queue');
   Future<List<E>> getAllLazy<E>(String boxName) async {
     final box = _boxBase(boxName);
     if (box is! LazyBox<dynamic>) {
@@ -676,7 +781,7 @@ class HiveStorage {
   /// Pass [key] to only listen to changes on a specific key.
   ///
   /// Example — log every change in a box:
-  ///   BaabaStorage.hive.watch('orders').listen((event) {
+  ///   BaabaHive.instance.watch('orders').listen((event) {
   ///     print('Key ${event.key} changed to ${event.value}');
   ///   });
   Stream<BoxEvent> watch(String boxName, {dynamic key}) =>
@@ -689,7 +794,7 @@ class HiveStorage {
   ///
   /// Example:
   ///   `ValueListenableBuilder<Box<dynamic>>`(
-  ///     valueListenable: BaabaStorage.hive.listenable('settings'),
+  ///     valueListenable: BaabaHive.instance.listenable('settings'),
   ///     builder: (context, box, _) {
   ///       return Text(box.get('theme') ?? 'light');
   ///     },

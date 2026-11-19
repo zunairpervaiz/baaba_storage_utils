@@ -20,7 +20,7 @@
 //
 // NOT ideal for:
 //   - Large amounts of data (each read/write goes through the OS crypto layer)
-//   - Non-sensitive data (use PrefsStorage or HiveStorage instead)
+//   - Non-sensitive data (use PrefsStorage, or Hive via baaba_storage_hive)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -66,7 +66,9 @@ class SecureStorage {
   ///
   /// Call this BEFORE [BaabaStorage.init] if you need custom behaviour, e.g.
   /// different keychain accessibility on iOS or an isolated Android
-  /// `storageNamespace`.
+  /// `storageNamespace` — or pass the same options to [BaabaStorage.init]
+  /// instead. `init` keeps this configuration when it is given no options of
+  /// its own, and replaces it entirely when it is.
   ///
   /// All parameters are optional — omit any platform you don't need to customise.
   ///
